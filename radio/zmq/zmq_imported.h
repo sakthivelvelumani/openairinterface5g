@@ -17,7 +17,7 @@
 class zmq_tx_channel {
  public:
   void *socket_;
-  overflow_buffer buffer_;
+  overflow_buffer<cf_t> buffer_;
   std::atomic<uint64_t> sample_count_ = 0;
   std::atomic<bool> is_tx_enabled_ = false;
   std::mutex transmit_alignment_mutex_;
@@ -37,7 +37,7 @@ class zmq_tx_channel {
 class zmq_rx_channel {
  public:
   void *socket_;
-  overflow_buffer buffer_;
+  overflow_buffer<cf_t> buffer_;
   bool request_sent_;
   std::atomic<bool> stopped_;
   zmq_rx_channel(void *s, uint64_t buffer_size) : socket_(s), buffer_(buffer_size), stopped_(false)

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: LicenseRef-CSSL-1.0
 
 pkg_check_modules(zmq REQUIRED libzmq)
-add_library(ring_buffer ring_buffer.cpp)
+add_library(ring_buffer INTERFACE)
 add_library(zmq_imported zmq_imported.cpp)
 target_include_directories(zmq_imported PUBLIC ./)
 target_link_libraries(zmq_imported PUBLIC ${zmq_LIBRARIES} log_headers)
 
-target_include_directories(ring_buffer PUBLIC ./)
+target_include_directories(ring_buffer INTERFACE ./)
 add_library(oai_zmqdevif SHARED zmq_radio.cpp)
 target_link_libraries(oai_zmqdevif PUBLIC ${zmq_LIBRARIES} ring_buffer log_headers zmq_imported)
 target_include_directories(oai_zmqdevif PUBLIC ${zmq_INCLUDE_DIRS})

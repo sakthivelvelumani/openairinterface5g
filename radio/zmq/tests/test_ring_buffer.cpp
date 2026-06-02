@@ -7,7 +7,7 @@
 
 TEST(CircularBuffer, simplePushPop)
 {
-  ring_buffer cb(10);
+  ring_buffer<cf_t> cb(10);
   cf_t data[10];
   for (int i = 0; i < 10; i++) {
     data[i] = { (float)i, (float)(i + 1)};
@@ -27,7 +27,7 @@ TEST(CircularBuffer, simplePushPop)
 
 TEST(CircularBuffer, overflow)
 {
-  ring_buffer cb(10);
+  ring_buffer<cf_t> cb(10);
   cf_t data[15];
   for (int i = 0; i < 15; i++) {
     data[i] = {(float)i, (float)(i + 1)};
@@ -44,7 +44,7 @@ TEST(CircularBuffer, overflow)
 
 TEST(CircularBuffer, partialPop)
 {
-  ring_buffer cb(10);
+  ring_buffer<cf_t> cb(10);
   cf_t data[10];
   for (int i = 0; i < 10; i++) {
     data[i] = {(float)i, (float)(i + 1)};
@@ -66,7 +66,7 @@ TEST(CircularBuffer, partialPop)
 
 TEST(CircularBuffer, popMore)
 {
-  ring_buffer cb(10);
+  ring_buffer<cf_t> cb(10);
   cf_t data[10];
   for (int i = 0; i < 10; i++) {
     data[i] = {(float)i, (float)(i + 1)};
@@ -82,7 +82,7 @@ TEST(CircularBuffer, popMore)
 
 TEST(CircularBuffer, newOverflow)
 {
-  ring_buffer cb(10);
+  ring_buffer<cf_t> cb(10);
   cf_t data1[8];
   for (int i = 0; i < 8; i++) {
     data1[i] = {(float)i, (float)(i + 1)};
