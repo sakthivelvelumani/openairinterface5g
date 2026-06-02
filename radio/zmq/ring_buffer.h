@@ -40,6 +40,7 @@ class overflow_buffer {
   {
   }
   size_t push_samples(const T *samples, size_t nsamps);
+  size_t push_header(const void *header, size_t nbytes);
   size_t push_zeros(size_t num_zeros);
   size_t pop_samples(T *samples, size_t num_samples);
   void reset();

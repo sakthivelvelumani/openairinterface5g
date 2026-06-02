@@ -43,3 +43,5 @@ endif()
 if (ENABLE_IMSCOPE OR ENABLE_IMSCOPE_RECORD)
   add_subdirectory(imscope)
 endif()
+
+add_subdirectory(zmqscope)
