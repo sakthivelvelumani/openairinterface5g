@@ -259,6 +259,15 @@ int nr_rx_pdsch(PHY_VARS_NR_UE *ue,
                 pdsch_scope_req_t *scope_req,
                 c16_t rho_dl[][dlsch->cw_info.Nl * dlsch->cw_info.Nl][rx_size_symbol]);
 
+int pdsch_process_symbol(const c16_t *rxdataF,
+                         const c16_t *chest,
+                         int16_t *llr,
+                         const freq_alloc_bitmap_t *freq_alloc,
+                         uint8_t symbol,
+                         uint32_t ofdm_symbol_size,
+                         uint8_t mod_order,
+                         const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config);
+
 int32_t generate_nr_prach(PHY_VARS_NR_UE *ue, uint8_t gNB_id, int frame, uint8_t slot, c16_t **txData);
 void apply_ntn_config(PHY_VARS_NR_UE *UE,
                       const NR_DL_FRAME_PARMS *fp,

@@ -17,6 +17,8 @@
 #include "PHY/NR_REFSIG/nr_refsig.h"
 #include "PHY/NR_REFSIG/dmrs_nr.h"
 #include "common/utils/nr/nr_common.h"
+#include "platform_types.h"
+#include "utils.h"
 #include <complex.h>
 #include "openair1/PHY/TOOLS/phy_scope_interface.h"
 #include "nfapi/open-nFAPI/nfapi/public_inc/nfapi_nr_interface.h"
@@ -29,7 +31,7 @@
 #define print_ints(s,x) printf("%s = %d %d %d %d\n",s,(x)[0],(x)[1],(x)[2],(x)[3])
 #define print_shorts(s,x) printf("%s = [%d+j*%d, %d+j*%d, %d+j*%d, %d+j*%d]\n",s,(x)[0],(x)[1],(x)[2],(x)[3],(x)[4],(x)[5],(x)[6],(x)[7])
 
-static bool overlap_csi_symbol(fapi_nr_dl_config_csirs_pdu_rel15_t *csi_pdu, int symbol)
+static bool overlap_csi_symbol(const fapi_nr_dl_config_csirs_pdu_rel15_t *csi_pdu, int symbol)
 {
   int num_l0 [18] = {1, 1, 1, 1, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 4, 2, 2, 4};
   for (int s = 0; s < num_l0[csi_pdu->row - 1]; s++) {
@@ -46,13 +48,13 @@ static bool overlap_csi_symbol(fapi_nr_dl_config_csirs_pdu_rel15_t *csi_pdu, int
   return false;
 }
 
-static uint32_t build_csi_overlap_bitmap(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config, int symbol)
+static uint32_t build_csi_overlap_bitmap(const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config, int symbol)
 {
   // LS 16 bits for even RBs, MS 16 bits for odd RBs
   uint32_t csi_res_bitmap = 0;
   int num_k[18] = {1, 1, 1, 1, 1, 4, 2, 2, 6, 3, 4, 4, 3, 3, 3, 4, 4, 4};
   for (int i = 0; i < dlsch_config->numCsiRsForRateMatching; i++) {
-    fapi_nr_dl_config_csirs_pdu_rel15_t *csi_pdu = &dlsch_config->csiRsForRateMatching[i];
+    const fapi_nr_dl_config_csirs_pdu_rel15_t *csi_pdu = &dlsch_config->csiRsForRateMatching[i];
 
     if (!overlap_csi_symbol(csi_pdu, symbol))
       continue;
@@ -1194,4 +1196,162 @@ int nr_rx_pdsch(PHY_VARS_NR_UE *ue,
            dl_ch_estimates_ext,
            sizeof(dl_ch_estimates_ext));
   return 0;
+}
+
+#define NUM_AVX2_VECT 3
+#define NUM_AVX2_RE NUM_AVX2_VECT * 8
+
+static inline int compress_c16_inplace(c16_t *arr, uint32_t mask)
+{
+  int w = 0;
+  uint32_t m = mask;
+  while (m) {
+    int i = __builtin_ctz(m);
+    arr[w++] = arr[i];
+    m &= m - 1;
+  }
+  return w;
+}
+
+// Process 2 PRBs
+static int process_symbol_subband(const c16_t *rxdataF, const c16_t *chest, int16_t *llr, uint8_t mod_order, uint32_t valid_re_mask)
+{
+  int16_t *llr_start = llr;
+  // channel level calc
+  const int16_t x = factor2(NUM_AVX2_RE);
+  const int16_t y = NUM_AVX2_RE >> x;
+  const int32_t avg = simde_mm_average((simde__m128i *)chest, NUM_AVX2_RE, x, y);
+
+  // compensation
+  const uint8_t num_rx = 1;
+  const int32_t log2_maxh = (log2_approx(avg) >> 1) + 1 + log2_approx(num_rx);
+  const simde__m256i *rxF256 = (const simde__m256i *)rxdataF;
+  const simde__m256i *ch256 = (const simde__m256i *)chest;
+  for (uint_fast8_t i = 0; i < NUM_AVX2_VECT; i++) {
+    const uint8_t curr_mask = (valid_re_mask >> (i * 8)) & 0xff;
+    if (curr_mask == 0) // No valid REs
+      continue;
+
+    simde__m256i chmaga;
+    simde__m256i chmagb;
+    simde__m256i chmagc;
+    simde__m256i comp = oai_mm256_cpx_mult_conj(ch256[i], rxF256[i], log2_maxh);
+
+    simde__m256i mag = oai_mm256_smadd(ch256[i], ch256[i], avg);
+    mag = simde_mm256_packs_epi32(mag, mag);
+    mag = simde_mm256_unpacklo_epi16(mag, mag);
+    if (mod_order == 4)
+      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM16_n1));
+    else if (mod_order == 6) {
+      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM64_n1));
+      chmagb = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM64_n2));
+    } else if (mod_order == 8) {
+      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n1));
+      chmagb = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n2));
+      chmagc = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n3));
+    }
+
+    int num_valid_re = 0;
+    if (curr_mask == 0xff) {
+      num_valid_re = 8;
+    } else {
+      // Group valid REs to start of buffer
+      num_valid_re = compress_c16_inplace((c16_t *)&comp, curr_mask);
+    }
+
+    // LLR generation
+    switch (mod_order) {
+      case 2:
+        nr_qpsk_llr((c16_t *)&comp, llr, num_valid_re);
+        break;
+
+      case 4:
+        nr_16qam_llr((c16_t *)&comp, (c16_t *)&chmaga, llr, num_valid_re);
+        break;
+
+      case 6:
+        nr_64qam_llr((c16_t *)&comp, (c16_t *)&chmaga, (c16_t *)&chmagb, llr, num_valid_re);
+        break;
+
+      case 8:
+        nr_256qam_llr((c16_t *)&comp, (c16_t *)&chmaga, (c16_t *)&chmagb, (c16_t *)&chmagc, llr, num_valid_re);
+        break;
+
+      default:
+        AssertFatal(0, "Unknown mod order!\n");
+    }
+    llr += (num_valid_re * mod_order);
+  }
+  return (int)(llr - llr_start);
+}
+
+static inline uint32_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cdm_groups)
+{
+  if (config_type == NFAPI_NR_DMRS_TYPE1)
+    AssertFatal(n_dmrs_cdm_groups == 1 || n_dmrs_cdm_groups == 2, "n_dmrs_cdm_groups %d is illegal\n", n_dmrs_cdm_groups);
+  else
+    AssertFatal(n_dmrs_cdm_groups == 1 || n_dmrs_cdm_groups == 2 || n_dmrs_cdm_groups == 3,
+                "n_dmrs_cdm_groups %d is illegal\n",
+                n_dmrs_cdm_groups);
+
+  uint32_t dmrs_rb_bitmap = 0;
+  if (config_type == NFAPI_NR_DMRS_TYPE1 && n_dmrs_cdm_groups == 1)
+    dmrs_rb_bitmap = 0x555; // alternating REs starting from 0
+  else if (config_type == NFAPI_NR_DMRS_TYPE2 && n_dmrs_cdm_groups == 1)
+    dmrs_rb_bitmap = 0xc3; // REs 0,1 and 6,7
+  else if (config_type == NFAPI_NR_DMRS_TYPE2 && n_dmrs_cdm_groups == 2)
+    dmrs_rb_bitmap = 0x3cf; // REs 0,1,2,3 and 6,7,8,9
+  else
+    dmrs_rb_bitmap = 0xfff; // all REs taken by dmrs
+
+  return dmrs_rb_bitmap;
+}
+
+// Returns valid RE bitmap for 2 RBs starting from LSB.
+static inline uint32_t get_combined_valid_re_bitmap(int rb_idx, uint32_t dmrs_re_bitmap, uint32_t csi_re_bitmap)
+{
+  uint32_t bitmap_even = (~csi_re_bitmap & ~dmrs_re_bitmap) & 0xfff;
+  uint32_t bitmap_odd = (~(csi_re_bitmap >> 16) & ~dmrs_re_bitmap) & 0xfff; // MS 16bits for odd RB
+  if (rb_idx & 1)
+    return ((bitmap_even << 12) | bitmap_odd);
+  else
+    return ((bitmap_odd << 12) | bitmap_even);
+}
+
+int pdsch_process_symbol(const c16_t *rxdataF,
+                         const c16_t *chest,
+                         int16_t *llr,
+                         const freq_alloc_bitmap_t *freq_alloc,
+                         uint8_t symbol,
+                         uint32_t ofdm_symbol_size,
+                         uint8_t mod_order,
+                         const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config)
+{
+  int16_t *llr_start = llr;
+  // CSI RE bitmap (LS 16bits even, MS 16bits odd RBs)
+  uint32_t csi_res_bitmap = build_csi_overlap_bitmap(dlsch_config, symbol);
+
+  // DMRS RE bitmap
+  uint32_t dmrs_res_bitmap = 0;
+  if (IS_BIT_SET(dlsch_config->dlDmrsSymbPos, symbol))
+    dmrs_res_bitmap = get_dmrs_re_bitmap(dlsch_config->dmrsConfigType, dlsch_config->n_dmrs_cdm_groups);
+
+  int pos = 0;
+  int block_start, block_end;
+  while (find_next_rb_block(freq_alloc->bitmap, dlsch_config->BWPSize, &pos, &block_start, &block_end)) {
+    int start_rb = block_start + dlsch_config->BWPStart;
+    int nb_rb = block_end - block_start + 1;
+
+    // Process 2 contiguous PRBs
+    for (int rb = 0; rb < start_rb + nb_rb; rb += 2) {
+      int re_offset = rb * NR_NB_SC_PER_RB;
+      uint32_t valid_re_mask = get_combined_valid_re_bitmap(rb, dmrs_res_bitmap, csi_res_bitmap);
+
+      if (rb + 1 == start_rb + nb_rb) // Process only one RB
+        valid_re_mask &= 0xfff; // Nothing to process in second RB
+      int num_llr = process_symbol_subband(rxdataF + re_offset, chest + re_offset, llr, mod_order, valid_re_mask);
+      llr += num_llr;
+    }
+  }
+  return (int)(llr - llr_start);
 }
