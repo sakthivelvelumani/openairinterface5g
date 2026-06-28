@@ -466,14 +466,16 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
         dlschCfg->dlDmrsSymbPos,
         dlsch->cw_info.Nl);
 
-  const uint32_t pdsch_est_size = ((ue->frame_parms.symbols_per_slot * ue->frame_parms.ofdm_symbol_size + 15) / 16) * 16;
+  const uint32_t ofdm_symbol_size = ue->frame_parms.ofdm_symbol_size;
+  const uint32_t nb_rx = ue->frame_parms.nb_antennas_rx;
+  const uint32_t pdsch_est_size = ue->frame_parms.symbols_per_slot * ofdm_symbol_size;
   fourDimArray_t *toFree = NULL;
-  allocCast2D(pdsch_dl_ch_estimates, int32_t, toFree, ue->frame_parms.nb_antennas_rx * dlsch->cw_info.Nl, pdsch_est_size, false);
+  allocCast2D(pdsch_dl_ch_estimates, int32_t, toFree, nb_rx * dlsch->cw_info.Nl, pdsch_est_size, false);
 
-  c16_t ptrs_phase_per_slot[ue->frame_parms.nb_antennas_rx][NR_SYMBOLS_PER_SLOT];
+  c16_t ptrs_phase_per_slot[nb_rx][NR_SYMBOLS_PER_SLOT];
   memset(ptrs_phase_per_slot, 0, sizeof(ptrs_phase_per_slot));
 
-  int32_t ptrs_re_per_slot[ue->frame_parms.nb_antennas_rx][NR_SYMBOLS_PER_SLOT];
+  int32_t ptrs_re_per_slot[nb_rx][NR_SYMBOLS_PER_SLOT];
   memset(ptrs_re_per_slot, 0, sizeof(ptrs_re_per_slot));
 
   const uint32_t rx_size_symbol = (freq_alloc->num_rbs * NR_NB_SC_PER_RB + 15) & ~15;
@@ -486,30 +488,22 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
   for (int m = dlschCfg->start_symbol; m < (dlschCfg->start_symbol + dlschCfg->number_symbols); m++) {
     if (dlschCfg->dlDmrsSymbPos & (1 << m)) {
       for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
-        LOG_D(PHY, "PDSCH Channel estimation layer %d, slot %d, symbol %d\n", nl, nr_slot_rx, m);
-        uint32_t nvar_tmp = 0;
-        nr_pdsch_channel_estimation(ue,
-                                    proc,
-                                    dlschCfg,
-                                    freq_alloc,
-                                    nl,
-                                    get_dmrs_port(nl, dlschCfg->dmrs_ports),
-                                    m,
-                                    pdsch_est_size,
-                                    pdsch_dl_ch_estimates,
-                                    ue->frame_parms.samples_per_slot_wCP,
-                                    rxdataF,
-                                    &nvar_tmp);
-        nvar += nvar_tmp;
-#if 0
-        ///LOG_M: the channel estimation
-        char filename[100];
-        for (uint8_t aarx=0; aarx<ue->frame_parms.nb_antennas_rx; aarx++) {
-          sprintf(filename,"PDSCH_CHANNEL_frame%d_slot%d_sym%d_port%d_rx%d.m", frame_rx, nr_slot_rx, m, nl, aarx);
-          int **dl_ch_estimates = ue->pdsch_vars[gNB_id]->dl_ch_estimates;
-          LOG_M(filename,"channel_F",&dl_ch_estimates[nl*ue->frame_parms.nb_antennas_rx+aarx][ue->frame_parms.ofdm_symbol_size*m],ue->frame_parms.ofdm_symbol_size, 1, 1);
+        for (int aarx = 0; aarx < nb_rx; aarx++) {
+          LOG_D(PHY, "PDSCH Channel estimation layer %d, slot %d, symbol %d\n", nl, nr_slot_rx, m);
+          uint32_t nvar_tmp = 0;
+          nr_pdsch_channel_estimation(ue,
+                                      proc,
+                                      dlschCfg,
+                                      freq_alloc,
+                                      get_dmrs_port(nl, dlschCfg->dmrs_ports),
+                                      m,
+                                      ofdm_symbol_size,
+                                      pdsch_dl_ch_estimates[nl * nb_rx + aarx] + m * ofdm_symbol_size,
+                                      ofdm_symbol_size,
+                                      rxdataF[aarx] + m * ofdm_symbol_size,
+                                      &nvar_tmp);
+          nvar += nvar_tmp;
         }
-#endif
       }
     }
   }
