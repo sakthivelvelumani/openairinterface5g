@@ -1218,27 +1218,23 @@ void nr_pdsch_channel_estimation(PHY_VARS_NR_UE *ue,
                                  const UE_nr_rxtx_proc_t *proc,
                                  const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch,
                                  const freq_alloc_bitmap_t *freq_alloc,
-                                 int nl,
                                  unsigned short p,
                                  unsigned char symbol,
                                  uint32_t pdsch_est_size,
-                                 int32_t dl_ch_estimates[][pdsch_est_size],
+                                 int32_t dl_ch_estimates[pdsch_est_size],
                                  int rxdataFsize,
-                                 c16_t rxdataF[][rxdataFsize],
+                                 c16_t rxdataF[rxdataFsize],
                                  uint32_t *nvar)
 {
   // int gNB_id = proc->gNB_id;
   int slot = proc->nr_slot_rx;
   NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
-  const int ch_offset = fp->ofdm_symbol_size * symbol;
-  const int symbol_offset = fp->ofdm_symbol_size * symbol;
   int bwp_start_subcarrier = fp->first_carrier_offset + (dlsch->BWPStart + freq_alloc->first_rb) * 12;
 
 #ifdef DEBUG_PDSCH
   printf(
-      "PDSCH Channel Estimation : ch_offset %d, symbol_offset %d OFDM size %d, Ncp=%d, Ns=%d, bwp_start_subcarrier=%d "
+      "PDSCH Channel Estimation : symbol_offset %d OFDM size %d, Ncp=%d, Ns=%d, bwp_start_subcarrier=%d "
       "symbol %d\n",
-      ch_offset,
       symbol_offset,
       fp->ofdm_symbol_size,
       fp->Ncp,
@@ -1261,58 +1257,56 @@ void nr_pdsch_channel_estimation(PHY_VARS_NR_UE *ue,
 
   delay_t delay = {0};
 
-  for (int aarx = 0; aarx < fp->nb_antennas_rx; aarx++) {
 #ifdef DEBUG_PDSCH
-    printf("\n============================================\n");
-    printf("==== Tx port %i, Rx antenna %i, Symbol %i ====\n", p, aarx, symbol);
-    printf("============================================\n");
+  printf("\n============================================\n");
+  printf("==== Tx port %i, Rx antenna %i, Symbol %i ====\n", p, aarx, symbol);
+  printf("============================================\n");
 #endif
 
-    c16_t *rxF = &rxdataF[aarx][symbol_offset + delta];
-    c16_t *dl_ch = (c16_t *)&dl_ch_estimates[nl * fp->nb_antennas_rx + aarx][ch_offset];
-    memset(dl_ch, 0, sizeof(*dl_ch) * fp->ofdm_symbol_size);
+  c16_t *rxF = &rxdataF[delta];
+  c16_t *dl_ch = (c16_t *)dl_ch_estimates;
+  memset(dl_ch, 0, sizeof(*dl_ch) * fp->ofdm_symbol_size);
 
-    if (config_type == NFAPI_NR_DMRS_TYPE1 && ue->chest_freq == 0) {
-      NFAPI_NR_DMRS_TYPE1_linear_interp(fp,
-                                        rxF,
-                                        &pilot[6 * rb_offset],
-                                        dl_ch,
-                                        bwp_start_subcarrier,
-                                        freq_alloc,
-                                        dlsch->BWPSize,
-                                        &delay,
-                                        nvar);
+  if (config_type == NFAPI_NR_DMRS_TYPE1 && ue->chest_freq == 0) {
+    NFAPI_NR_DMRS_TYPE1_linear_interp(fp,
+                                      rxF,
+                                      &pilot[6 * rb_offset],
+                                      dl_ch,
+                                      bwp_start_subcarrier,
+                                      freq_alloc,
+                                      dlsch->BWPSize,
+                                      &delay,
+                                      nvar);
 
-    } else if (config_type == NFAPI_NR_DMRS_TYPE2 && ue->chest_freq == 0) {
-      NFAPI_NR_DMRS_TYPE2_linear_interp(fp,
-                                        rxF,
-                                        &pilot[4 * rb_offset],
-                                        dl_ch,
-                                        bwp_start_subcarrier,
-                                        freq_alloc,
-                                        dlsch->BWPSize,
-                                        &delay,
-                                        nvar);
+  } else if (config_type == NFAPI_NR_DMRS_TYPE2 && ue->chest_freq == 0) {
+    NFAPI_NR_DMRS_TYPE2_linear_interp(fp,
+                                      rxF,
+                                      &pilot[4 * rb_offset],
+                                      dl_ch,
+                                      bwp_start_subcarrier,
+                                      freq_alloc,
+                                      dlsch->BWPSize,
+                                      &delay,
+                                      nvar);
 
-    } else if (config_type == NFAPI_NR_DMRS_TYPE1) {
-      AssertFatal(dlsch->resource_alloc == 1, "PRB average in channel estimation not supported for type0 DLSCH\n");
-      NFAPI_NR_DMRS_TYPE1_average_prb(fp, rxF, &pilot[6 * rb_offset], dl_ch, bwp_start_subcarrier, nb_rb_pdsch);
+  } else if (config_type == NFAPI_NR_DMRS_TYPE1) {
+    AssertFatal(dlsch->resource_alloc == 1, "PRB average in channel estimation not supported for type0 DLSCH\n");
+    NFAPI_NR_DMRS_TYPE1_average_prb(fp, rxF, &pilot[6 * rb_offset], dl_ch, bwp_start_subcarrier, nb_rb_pdsch);
 
-    } else {
-      AssertFatal(dlsch->resource_alloc == 1, "PRB average in channel estimation not supported for type0 DLSCH\n");
-      NFAPI_NR_DMRS_TYPE2_average_prb(fp, rxF, &pilot[4 * rb_offset], dl_ch, bwp_start_subcarrier, nb_rb_pdsch);
-    }
-
-#ifdef DEBUG_PDSCH
-    dl_ch = (c16_t *)&dl_ch_estimates[nl * fp->nb_antennas_rx + aarx][ch_offset];
-    for (uint16_t idxP = 0; idxP < ceil((float)nb_rb_pdsch * 12 / 8); idxP++) {
-      for (uint8_t idxI = 0; idxI < 8; idxI++) {
-        printf("%4d\t%4d\t", dl_ch[idxP * 8 + idxI].r, dl_ch[idxP * 8 + idxI].i);
-      }
-      printf("%2d\n", idxP);
-    }
-#endif
+  } else {
+    AssertFatal(dlsch->resource_alloc == 1, "PRB average in channel estimation not supported for type0 DLSCH\n");
+    NFAPI_NR_DMRS_TYPE2_average_prb(fp, rxF, &pilot[4 * rb_offset], dl_ch, bwp_start_subcarrier, nb_rb_pdsch);
   }
+
+#ifdef DEBUG_PDSCH
+  dl_ch = (c16_t *)dl_ch_estimates;
+  for (uint16_t idxP = 0; idxP < ceil((float)nb_rb_pdsch * 12 / 8); idxP++) {
+    for (uint8_t idxI = 0; idxI < 8; idxI++) {
+      printf("%4d\t%4d\t", dl_ch[idxP * 8 + idxI].r, dl_ch[idxP * 8 + idxI].i);
+    }
+    printf("%2d\n", idxP);
+  }
+#endif
 }
 
 /*******************************************************************
