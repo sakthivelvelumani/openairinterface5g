@@ -6,6 +6,11 @@
  * \brief Implementation of UE procedures from 36.213 LTE specifications
  */
 
+#include "PHY/defs_RU.h"
+#include "PHY/nr_phy_common/inc/nr_ue_phy_meas.h"
+#include "platform_types.h"
+#include "utils.h"
+#include <stdint.h>
 #define _GNU_SOURCE
 
 #include "nr/nr_common.h"
@@ -427,6 +432,91 @@ static void nr_ue_measurement_procedures(uint16_t l,
     phy_adjust_gain_nr (ue,ue->measurements.rx_power_avg_dB[gNB_id],gNB_id);
     
   }
+}
+
+static void fftshift(c16_t *in, int nbins, int fft_size)
+{
+  const int neg = nbins / 2; // # negative-freq bins
+  c16_t tmp[fft_size / 2]; // holds the negative half
+
+  // save negative bins (they sit at the tail: indices N-neg .. N-1)
+  memcpy(tmp, in + fft_size - neg, neg * sizeof(c16_t));
+  // slide DC + positive (and trailing zeros) to the right by neg
+  memmove(in + neg, in, (fft_size - neg) * sizeof(c16_t));
+  // place negative bins at the front
+  memcpy(in, tmp, neg * sizeof(c16_t));
+}
+
+static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
+                                       const UE_nr_rxtx_proc_t *proc,
+                                       NR_UE_DLSCH_t *dlsch,
+                                       NR_DL_UE_HARQ_t *dlsch_harq,
+                                       fapi_nr_dl_config_dlsch_pdu_rel15_t *dlschCfg,
+                                       int16_t *llr,
+                                       c16_t rxdataF[][ue->frame_parms.samples_per_slot_wCP],
+                                       freq_alloc_bitmap_t *freq_alloc)
+{
+  NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
+  fourDimArray_t *toFree = NULL;
+  int16_t *llr_start = llr;
+  allocCast2D(chest, int32_t, toFree, fp->nb_antennas_rx * dlsch->cw_info.Nl, fp->ofdm_symbol_size, false);
+
+  // If there are data symbols before first DMRS symbol, use that estimates for the preceeding data symbols
+  int first_dmrs_symbol = __builtin_ctz(dlschCfg->dlDmrsSymbPos);
+  if (first_dmrs_symbol > dlschCfg->start_symbol) {
+    for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
+      uint32_t nvar_tmp = 0;
+      nr_pdsch_channel_estimation(ue,
+                                  proc,
+                                  dlschCfg,
+                                  freq_alloc,
+                                  get_dmrs_port(nl, dlschCfg->dmrs_ports),
+                                  first_dmrs_symbol,
+                                  fp->ofdm_symbol_size,
+                                  chest[0],
+                                  ue->frame_parms.samples_per_slot_wCP,
+                                  rxdataF[0] + first_dmrs_symbol * fp->ofdm_symbol_size,
+                                  &nvar_tmp);
+    }
+  }
+
+  // Process symbols
+  start_meas_nr_ue_phy(ue, RX_PDSCH_STATS);
+  for (int m = dlschCfg->start_symbol; m < (dlschCfg->start_symbol + dlschCfg->number_symbols); m++) {
+    if (IS_BIT_SET(dlschCfg->dlDmrsSymbPos, m) && m < first_dmrs_symbol) {
+      for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
+        uint32_t nvar_tmp = 0;
+        nr_pdsch_channel_estimation(ue,
+                                    proc,
+                                    dlschCfg,
+                                    freq_alloc,
+                                    get_dmrs_port(nl, dlschCfg->dmrs_ports),
+                                    m,
+                                    fp->ofdm_symbol_size,
+                                    chest[0],
+                                    ue->frame_parms.samples_per_slot_wCP,
+                                    rxdataF[0] + m * fp->ofdm_symbol_size,
+                                    &nvar_tmp);
+      }
+    }
+
+    // FFT shift rxdataF
+    fftshift(rxdataF[0] + m * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+
+    // Generate LLRs for one symbol
+    int llr_count = pdsch_process_symbol(rxdataF[0] + m * fp->ofdm_symbol_size,
+                                         (const c16_t *)chest[0],
+                                         llr,
+                                         freq_alloc,
+                                         m,
+                                         fp->ofdm_symbol_size,
+                                         dlsch->cw_info.qamModOrder,
+                                         dlschCfg);
+    llr += llr_count;
+  }
+  stop_meas_nr_ue_phy(ue, RX_PDSCH_STATS);
+  free(toFree);
+  return (int)(llr - llr_start);
 }
 
 static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
@@ -1238,7 +1328,8 @@ void pdsch_processing(PHY_VARS_NR_UE *ue, const UE_nr_rxtx_proc_t *proc, nr_phy_
     // dlsch_harq contains the previous transmissions data for this harq pid
     NR_DL_UE_HARQ_t *harq = &ue->dl_harq_processes[c][dlsch_config->harq_process_nbr];
     // it returns -1 in case of internal failure, or 0 in case of normal result
-    int ret_pdsch = nr_ue_pdsch_procedures(ue, proc, dlsch, harq, dlsch_config, llr[c], rxdataF, &freq_alloc);
+    // int ret_pdsch = nr_ue_pdsch_procedures(ue, proc, dlsch, harq, dlsch_config, llr[c], rxdataF, &freq_alloc);
+    int ret_pdsch = nr_ue_pdsch_procedures_lite(ue, proc, dlsch, harq, dlsch_config, llr[c], rxdataF, &freq_alloc);
     TracyCPlot("pdsch mcs", dlsch->cw_info.mcs);
 
     UEscopeCopy(ue, pdschLlr, llr[c], sizeof(int16_t), 1, G, 0);
