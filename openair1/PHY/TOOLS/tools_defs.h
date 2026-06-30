@@ -369,7 +369,7 @@ static __attribute__((always_inline)) inline void mult_complex_vectors(const c16
         (simde__m256i *)(out + i),
         simde_mm256_blend_epi16(simde_mm256_srai_epi32(re, shift), simde_mm256_slli_epi32(im, 16 - shift), 0xAA));
   }
-  if (size - i > 4) {
+  if (size - i >= 4) {
     const simde__m128i i1 = simde_mm_loadu_si128((simde__m128i *)(in1 + i));
     const simde__m128i i2 = simde_mm_loadu_si128((simde__m128i *)(in2 + i));
     const simde__m128i i2swap = simde_mm_shuffle_epi8(i2, *(simde__m128i *)&complex_shuffle256);
