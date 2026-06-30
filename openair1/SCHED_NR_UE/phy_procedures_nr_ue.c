@@ -447,6 +447,28 @@ static void fftshift(c16_t *in, int nbins, int fft_size)
   memcpy(in, tmp, neg * sizeof(c16_t));
 }
 
+static void buffer_relayout(const c16_t *in,
+                            int in_size,
+                            c16_t *out,
+                            int out_size,
+                            int nl,
+                            int nb_rx,
+                            int nb_rb,
+                            int symbol_idx,
+                            int symbol_size)
+{
+  int out_offset = 0;
+  for (int rb = 0; rb < nb_rb; rb++) {
+    for (int l = 0; l < nl; l++) {
+      for (int aarx = 0; aarx < nb_rx; aarx++) {
+        int in_offset = (l * nb_rx + aarx) * in_size + symbol_size * symbol_idx + rb * out_size;
+        memcpy(out + out_offset, in + in_offset, sizeof(*out) * out_size);
+        out_offset += out_size;
+      }
+    }
+  }
+}
+
 static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                                        const UE_nr_rxtx_proc_t *proc,
                                        NR_UE_DLSCH_t *dlsch,
@@ -457,26 +479,32 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                                        freq_alloc_bitmap_t *freq_alloc)
 {
   NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
+  const int nb_rx = fp->nb_antennas_rx;
+  const int nl = dlsch->cw_info.Nl;
   fourDimArray_t *toFree = NULL;
   int16_t *llr_start = llr;
-  allocCast2D(chest, int32_t, toFree, fp->nb_antennas_rx * dlsch->cw_info.Nl, fp->ofdm_symbol_size, false);
+  allocCast2D(chest, int32_t, toFree, nb_rx * nl, fp->ofdm_symbol_size, false);
+  c16_t *rxdataF_proc = malloc16(sizeof(*rxdataF_proc) * fp->ofdm_symbol_size * nb_rx * nl);
+  c16_t *chest_proc = malloc16(sizeof(*chest_proc) * fp->ofdm_symbol_size * nb_rx * nl);
 
   // If there are data symbols before first DMRS symbol, use that estimates for the preceeding data symbols
   int first_dmrs_symbol = __builtin_ctz(dlschCfg->dlDmrsSymbPos);
   if (first_dmrs_symbol > dlschCfg->start_symbol) {
-    for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
-      uint32_t nvar_tmp = 0;
-      nr_pdsch_channel_estimation(ue,
-                                  proc,
-                                  dlschCfg,
-                                  freq_alloc,
-                                  get_dmrs_port(nl, dlschCfg->dmrs_ports),
-                                  first_dmrs_symbol,
-                                  fp->ofdm_symbol_size,
-                                  chest[0],
-                                  ue->frame_parms.samples_per_slot_wCP,
-                                  rxdataF[0] + first_dmrs_symbol * fp->ofdm_symbol_size,
-                                  &nvar_tmp);
+    for (int l = 0; l < nl; l++) { // for MIMO Config: it shall loop over no_layers
+      for (int aarx = 0; aarx < nb_rx; aarx++) {
+        uint32_t nvar_tmp = 0;
+        nr_pdsch_channel_estimation(ue,
+                                    proc,
+                                    dlschCfg,
+                                    freq_alloc,
+                                    get_dmrs_port(l, dlschCfg->dmrs_ports),
+                                    first_dmrs_symbol,
+                                    fp->ofdm_symbol_size,
+                                    chest[l * nb_rx + aarx],
+                                    ue->frame_parms.samples_per_slot_wCP,
+                                    rxdataF[aarx] + first_dmrs_symbol * fp->ofdm_symbol_size,
+                                    &nvar_tmp);
+      }
     }
   }
 
@@ -484,38 +512,65 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
   start_meas_nr_ue_phy(ue, RX_PDSCH_STATS);
   for (int m = dlschCfg->start_symbol; m < (dlschCfg->start_symbol + dlschCfg->number_symbols); m++) {
     if (IS_BIT_SET(dlschCfg->dlDmrsSymbPos, m) && m < first_dmrs_symbol) {
-      for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
-        uint32_t nvar_tmp = 0;
-        nr_pdsch_channel_estimation(ue,
-                                    proc,
-                                    dlschCfg,
-                                    freq_alloc,
-                                    get_dmrs_port(nl, dlschCfg->dmrs_ports),
-                                    m,
-                                    fp->ofdm_symbol_size,
-                                    chest[0],
-                                    ue->frame_parms.samples_per_slot_wCP,
-                                    rxdataF[0] + m * fp->ofdm_symbol_size,
-                                    &nvar_tmp);
+      for (int l = 0; l < nl; l++) { // for MIMO Config: it shall loop over no_layers
+        for (int aarx = 0; aarx < nb_rx; aarx++) {
+          uint32_t nvar_tmp = 0;
+          nr_pdsch_channel_estimation(ue,
+                                      proc,
+                                      dlschCfg,
+                                      freq_alloc,
+                                      get_dmrs_port(l, dlschCfg->dmrs_ports),
+                                      m,
+                                      fp->ofdm_symbol_size,
+                                      chest[l * nb_rx + aarx],
+                                      ue->frame_parms.samples_per_slot_wCP,
+                                      rxdataF[aarx] + m * fp->ofdm_symbol_size,
+                                      &nvar_tmp);
+        }
       }
     }
 
     // FFT shift rxdataF
-    fftshift(rxdataF[0] + m * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+    for (int aarx = 0; aarx < nb_rx; aarx++)
+      fftshift(rxdataF[aarx] + m * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+
+    // Relayout buffer to process in groups of two PRBs
+    buffer_relayout((const c16_t *)rxdataF,
+                    ue->frame_parms.samples_per_slot_wCP,
+                    rxdataF_proc,
+                    NR_NB_SC_PER_RB,
+                    nl,
+                    nb_rx,
+                    fp->N_RB_DL,
+                    m,
+                    fp->ofdm_symbol_size);
+    buffer_relayout((const c16_t *)chest,
+                    fp->ofdm_symbol_size,
+                    chest_proc,
+                    NR_NB_SC_PER_RB,
+                    nl,
+                    nb_rx,
+                    fp->N_RB_DL,
+                    0,
+                    fp->ofdm_symbol_size);
 
     // Generate LLRs for one symbol
-    int llr_count = pdsch_process_symbol(rxdataF[0] + m * fp->ofdm_symbol_size,
-                                         (const c16_t *)chest[0],
+    int llr_count = pdsch_process_symbol(rxdataF_proc,
+                                         (const c16_t *)chest_proc,
                                          llr,
                                          freq_alloc,
                                          m,
                                          fp->ofdm_symbol_size,
                                          dlsch->cw_info.qamModOrder,
+                                         nb_rx,
+                                         nl,
                                          dlschCfg);
     llr += llr_count;
   }
   stop_meas_nr_ue_phy(ue, RX_PDSCH_STATS);
   free(toFree);
+  free(rxdataF_proc);
+  free(chest_proc);
   return (int)(llr - llr_start);
 }
 

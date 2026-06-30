@@ -266,6 +266,8 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                          uint8_t symbol,
                          uint32_t ofdm_symbol_size,
                          uint8_t mod_order,
+                         unsigned int nb_rx,
+                         unsigned int nb_layer,
                          const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config);
 
 int32_t generate_nr_prach(PHY_VARS_NR_UE *ue, uint8_t gNB_id, int frame, uint8_t slot, c16_t **txData);
