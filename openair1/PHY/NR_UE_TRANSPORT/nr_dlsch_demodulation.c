@@ -1223,7 +1223,9 @@ int nr_rx_pdsch(PHY_VARS_NR_UE *ue,
 }
 
 #define NUM_AVX2_VECT 3
+#define NUM_SSE_VECT NUM_AVX2_VECT
 #define NUM_AVX2_RE NUM_AVX2_VECT * 8
+#define NUM_SSE_RE NUM_AVX2_VECT * 4
 
 static inline int compress_c16_inplace(c16_t *arr, uint32_t mask)
 {
@@ -1237,47 +1239,57 @@ static inline int compress_c16_inplace(c16_t *arr, uint32_t mask)
   return w;
 }
 
-// Process 2 PRBs
-static int process_symbol_subband(const c16_t *rxdataF, const c16_t *chest, int16_t *llr, uint8_t mod_order, uint32_t valid_re_mask)
+// Process one PRB
+static int process_symbol_subband_sse(const c16_t *rxdataF,
+                                      const c16_t *chest,
+                                      int16_t *llr,
+                                      int num_antenna,
+                                      int num_layer,
+                                      uint8_t mod_order,
+                                      uint32_t valid_re_mask)
 {
   int16_t *llr_start = llr;
   // channel level calc
-  const int16_t x = factor2(NUM_AVX2_RE);
-  const int16_t y = NUM_AVX2_RE >> x;
-  const int32_t avg = simde_mm_average((simde__m128i *)chest, NUM_AVX2_RE, x, y);
+  const int16_t x = factor2(NUM_SSE_RE);
+  const int16_t y = NUM_SSE_RE >> x;
+  const int32_t avg = simde_mm_average((simde__m128i *)chest, NUM_SSE_RE, x, y);
 
   // compensation
-  const uint8_t num_rx = 1;
-  const int32_t log2_maxh = (log2_approx(avg) >> 1) + 1 + log2_approx(num_rx);
-  const simde__m256i *rxF256 = (const simde__m256i *)rxdataF;
-  const simde__m256i *ch256 = (const simde__m256i *)chest;
-  for (uint_fast8_t i = 0; i < NUM_AVX2_VECT; i++) {
-    const uint8_t curr_mask = (valid_re_mask >> (i * 8)) & 0xff;
+  const int32_t log2_maxh = (log2_approx(avg) >> 1) + 1 + log2_approx(num_antenna >> 1);
+  const simde__m128i *rxF128 = (const simde__m128i *)rxdataF;
+  const simde__m128i *ch128 = (const simde__m128i *)chest;
+  for (uint_fast8_t i = 0; i < NUM_SSE_VECT; i++) {
+    const uint8_t curr_mask = (valid_re_mask >> (i * 4)) & 0xf;
     if (curr_mask == 0) // No valid REs
       continue;
 
-    simde__m256i chmaga;
-    simde__m256i chmagb;
-    simde__m256i chmagc;
-    simde__m256i comp = oai_mm256_cpx_mult_conj(ch256[i], rxF256[i], log2_maxh);
+    simde__m128i chmaga = simde_mm_setzero_si128();
+    simde__m128i chmagb = simde_mm_setzero_si128();
+    simde__m128i chmagc = simde_mm_setzero_si128();
+    simde__m128i comp = simde_mm_setzero_si128();
+    // MRC
+    for (int aarx = 0; aarx < num_antenna; aarx++) {
+      comp = simde_mm_add_epi16(comp,
+                                oai_mm_cpx_mult_conj(ch128[NUM_SSE_VECT * aarx + i], rxF128[NUM_SSE_VECT * aarx + i], log2_maxh));
 
-    simde__m256i mag = oai_mm256_smadd(ch256[i], ch256[i], avg);
-    mag = simde_mm256_packs_epi32(mag, mag);
-    mag = simde_mm256_unpacklo_epi16(mag, mag);
-    if (mod_order == 4)
-      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM16_n1));
-    else if (mod_order == 6) {
-      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM64_n1));
-      chmagb = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM64_n2));
-    } else if (mod_order == 8) {
-      chmaga = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n1));
-      chmagb = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n2));
-      chmagc = simde_mm256_mulhrs_epi16(mag, simde_mm256_set1_epi16(QAM256_n3));
+      simde__m128i mag = oai_mm_smadd(ch128[NUM_SSE_VECT * aarx + i], ch128[NUM_SSE_VECT * aarx + i], log2_maxh);
+      mag = simde_mm_packs_epi32(mag, mag);
+      mag = simde_mm_unpacklo_epi16(mag, mag);
+      if (mod_order == 4)
+        chmaga = simde_mm_add_epi16(chmaga, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM16_n1)));
+      else if (mod_order == 6) {
+        chmaga = simde_mm_add_epi16(chmaga, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM64_n1)));
+        chmagb = simde_mm_add_epi16(chmagb, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM64_n2)));
+      } else if (mod_order == 8) {
+        chmaga = simde_mm_add_epi16(chmaga, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM256_n1)));
+        chmagb = simde_mm_add_epi16(chmagb, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM256_n2)));
+        chmagc = simde_mm_add_epi16(chmagc, simde_mm_mulhrs_epi16(mag, simde_mm_set1_epi16(QAM256_n3)));
+      }
     }
 
     int num_valid_re = 0;
-    if (curr_mask == 0xff) {
-      num_valid_re = 8;
+    if (curr_mask == 0xf) {
+      num_valid_re = 4;
     } else {
       // Group valid REs to start of buffer
       num_valid_re = compress_c16_inplace((c16_t *)&comp, curr_mask);
@@ -1331,15 +1343,13 @@ static inline uint32_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cd
   return dmrs_rb_bitmap;
 }
 
-// Returns valid RE bitmap for 2 RBs starting from LSB.
+// Returns valid RE bitmap starting from LSB.
 static inline uint32_t get_combined_valid_re_bitmap(int rb_idx, uint32_t dmrs_re_bitmap, uint32_t csi_re_bitmap)
 {
-  uint32_t bitmap_even = (~csi_re_bitmap & ~dmrs_re_bitmap) & 0xfff;
-  uint32_t bitmap_odd = (~(csi_re_bitmap >> 16) & ~dmrs_re_bitmap) & 0xfff; // MS 16bits for odd RB
   if (rb_idx & 1)
-    return ((bitmap_even << 12) | bitmap_odd);
+    return (~(csi_re_bitmap >> 16) & ~dmrs_re_bitmap) & 0xfff; // MS 16bits for odd RB
   else
-    return ((bitmap_odd << 12) | bitmap_even);
+    return (~csi_re_bitmap & ~dmrs_re_bitmap) & 0xfff;
 }
 
 int pdsch_process_symbol(const c16_t *rxdataF,
@@ -1349,6 +1359,8 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                          uint8_t symbol,
                          uint32_t ofdm_symbol_size,
                          uint8_t mod_order,
+                         unsigned int nb_rx,
+                         unsigned int nb_layer,
                          const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config)
 {
   int16_t *llr_start = llr;
@@ -1366,14 +1378,13 @@ int pdsch_process_symbol(const c16_t *rxdataF,
     int start_rb = block_start + dlsch_config->BWPStart;
     int nb_rb = block_end - block_start + 1;
 
-    // Process 2 contiguous PRBs
-    for (int rb = 0; rb < start_rb + nb_rb; rb += 2) {
-      int re_offset = rb * NR_NB_SC_PER_RB;
+    // Process one PRB
+    for (int rb = start_rb; rb < start_rb + nb_rb; rb++) {
+      int re_offset = rb * nb_rx * nb_layer * NR_NB_SC_PER_RB;
       uint32_t valid_re_mask = get_combined_valid_re_bitmap(rb, dmrs_res_bitmap, csi_res_bitmap);
 
-      if (rb + 1 == start_rb + nb_rb) // Process only one RB
-        valid_re_mask &= 0xfff; // Nothing to process in second RB
-      int num_llr = process_symbol_subband(rxdataF + re_offset, chest + re_offset, llr, mod_order, valid_re_mask);
+      int num_llr =
+          process_symbol_subband_sse(rxdataF + re_offset, chest + re_offset, llr, nb_rx, nb_layer, mod_order, valid_re_mask);
       llr += num_llr;
     }
   }
