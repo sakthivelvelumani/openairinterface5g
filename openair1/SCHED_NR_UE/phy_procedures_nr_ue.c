@@ -484,8 +484,9 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
   fourDimArray_t *toFree = NULL;
   int16_t *llr_start = llr;
   allocCast2D(chest, int32_t, toFree, nb_rx * nl, fp->ofdm_symbol_size, false);
-  c16_t *rxdataF_proc = malloc16(sizeof(*rxdataF_proc) * fp->ofdm_symbol_size * nb_rx * nl);
+  c16_t *rxdataF_proc = malloc16(sizeof(*rxdataF_proc) * fp->ofdm_symbol_size * nb_rx);
   c16_t *chest_proc = malloc16(sizeof(*chest_proc) * fp->ofdm_symbol_size * nb_rx * nl);
+  uint32_t nvar = 0;
 
   // If there are data symbols before first DMRS symbol, use that estimates for the preceeding data symbols
   int first_dmrs_symbol = __builtin_ctz(dlschCfg->dlDmrsSymbPos);
@@ -504,6 +505,7 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                                     ue->frame_parms.samples_per_slot_wCP,
                                     rxdataF[aarx] + first_dmrs_symbol * fp->ofdm_symbol_size,
                                     &nvar_tmp);
+        nvar += nvar_tmp;
       }
     }
   }
@@ -526,9 +528,12 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                                       ue->frame_parms.samples_per_slot_wCP,
                                       rxdataF[aarx] + m * fp->ofdm_symbol_size,
                                       &nvar_tmp);
+          nvar += nvar_tmp;
         }
       }
     }
+    if (m == dlschCfg->start_symbol)
+      nvar /= (dlschCfg->number_symbols * dlsch->cw_info.Nl * ue->frame_parms.nb_antennas_rx);
 
     // FFT shift rxdataF
     for (int aarx = 0; aarx < nb_rx; aarx++)
@@ -539,7 +544,7 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                     ue->frame_parms.samples_per_slot_wCP,
                     rxdataF_proc,
                     NR_NB_SC_PER_RB,
-                    nl,
+                    1,
                     nb_rx,
                     fp->N_RB_DL,
                     m,
@@ -564,6 +569,7 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
                                          dlsch->cw_info.qamModOrder,
                                          nb_rx,
                                          nl,
+                                         nvar,
                                          dlschCfg);
     llr += llr_count;
   }
