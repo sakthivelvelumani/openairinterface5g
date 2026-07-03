@@ -6,6 +6,7 @@
  * \brief Top-level routines for demodulating the PDSCH physical channel from 38-211, V15.2 2018-06
  */
 
+#include "PHY/NR_REFSIG/ptrs_nr.h"
 #include "PHY/TOOLS/tools_defs.h"
 #include "common/platform_constants.h"
 #include "nr_phy_common.h"
@@ -1389,18 +1390,22 @@ static inline int compress_c16_inplace(c16_t *arr, uint32_t mask)
 // Process one PRB
 static int process_symbol_subband_sse(const c16_t *rxdataF,
                                       const c16_t *chest,
+                                      c16_t cpe,
                                       int16_t *llr,
                                       uint32_t nvar,
                                       int num_antenna,
                                       int num_layer,
                                       uint8_t mod_order,
-                                      uint32_t valid_re_mask)
+                                      uint16_t valid_re_mask)
 {
   int16_t *llr_start = llr;
   // channel level calc
   const int16_t x = factor2(NUM_SSE_RE);
   const int16_t y = NUM_SSE_RE >> x;
   const int32_t avg = simde_mm_average((simde__m128i *)chest, NUM_SSE_RE, x, y);
+
+  // CPE
+  const simde__m128i cpe128 = simde_mm_set_epi16(cpe.i, cpe.r, cpe.i, cpe.r, cpe.i, cpe.r, cpe.i, cpe.r);
 
   // compensation
   const int32_t log2_maxh = (log2_approx(avg) >> 1) + log2_approx(num_antenna >> 1);
@@ -1426,7 +1431,9 @@ static int process_symbol_subband_sse(const c16_t *rxdataF,
       for (int aarx = 0; aarx < num_antenna; aarx++) {
         unsigned int choff = (layer * num_antenna + aarx) * NUM_SSE_VECT + i;
         unsigned int rxoff = aarx * NUM_SSE_VECT + i;
-        comp[layer] = simde_mm_add_epi16(comp[layer], oai_mm_cpx_mult_conj(ch128[choff], rxF128[rxoff], log2_maxh));
+        // chest + cpe
+        const simde__m128i ch128_cpe = oai_mm_cpx_mult(ch128[choff], cpe128, 15);
+        comp[layer] = simde_mm_add_epi16(comp[layer], oai_mm_cpx_mult_conj(ch128_cpe, rxF128[rxoff], log2_maxh));
 
         simde__m128i mag = oai_mm_smadd(ch128[choff], ch128[choff], log2_maxh);
         mag = simde_mm_packs_epi32(mag, mag);
@@ -1517,7 +1524,7 @@ static int process_symbol_subband_sse(const c16_t *rxdataF,
   return (int)(llr - llr_start);
 }
 
-static inline uint32_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cdm_groups)
+static inline uint16_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cdm_groups)
 {
   if (config_type == NFAPI_NR_DMRS_TYPE1)
     AssertFatal(n_dmrs_cdm_groups == 1 || n_dmrs_cdm_groups == 2, "n_dmrs_cdm_groups %d is illegal\n", n_dmrs_cdm_groups);
@@ -1526,7 +1533,7 @@ static inline uint32_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cd
                 "n_dmrs_cdm_groups %d is illegal\n",
                 n_dmrs_cdm_groups);
 
-  uint32_t dmrs_rb_bitmap = 0;
+  uint16_t dmrs_rb_bitmap = 0;
   if (config_type == NFAPI_NR_DMRS_TYPE1 && n_dmrs_cdm_groups == 1)
     dmrs_rb_bitmap = 0x555; // alternating REs starting from 0
   else if (config_type == NFAPI_NR_DMRS_TYPE2 && n_dmrs_cdm_groups == 1)
@@ -1539,17 +1546,30 @@ static inline uint32_t get_dmrs_re_bitmap(uint8_t config_type, uint8_t n_dmrs_cd
   return dmrs_rb_bitmap;
 }
 
-// Returns valid RE bitmap starting from LSB.
-static inline uint32_t get_combined_valid_re_bitmap(int rb_idx, uint32_t dmrs_re_bitmap, uint32_t csi_re_bitmap)
+static inline uint16_t get_ptrs_re_bitmap(uint rnti, uint nb_rb, uint rb, uint k_re_ref, uint k_ptrs, uint k_rb_ref)
 {
-  if (rb_idx & 1)
-    return (~(csi_re_bitmap >> 16) & ~dmrs_re_bitmap) & 0xfff; // MS 16bits for odd RB
+  if ((rb + k_rb_ref) % k_ptrs)
+    return 0;
   else
-    return (~csi_re_bitmap & ~dmrs_re_bitmap) & 0xfff;
+    return (1U << k_re_ref);
+}
+
+// Returns valid RE bitmap starting from LSB.
+static inline uint16_t get_combined_valid_re_bitmap(int rb_idx,
+                                                    uint16_t ptrs_re_bitmap,
+                                                    uint16_t dmrs_re_bitmap,
+                                                    uint32_t csi_re_bitmap)
+{
+  const uint16_t ptrs_dmrs = (~ptrs_re_bitmap & ~dmrs_re_bitmap) & 0xfff;
+  if (rb_idx & 1)
+    return (~(csi_re_bitmap >> 16) & ptrs_dmrs); // MS 16bits for odd RB
+  else
+    return (~csi_re_bitmap & ptrs_dmrs);
 }
 
 int pdsch_process_symbol(const c16_t *rxdataF,
                          const c16_t *chest,
+                         c16_t cpe,
                          int16_t *llr,
                          const freq_alloc_bitmap_t *freq_alloc,
                          uint8_t symbol,
@@ -1558,6 +1578,8 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                          unsigned int nb_rx,
                          unsigned int nb_layer,
                          uint32_t nvar,
+                         uint16_t ptrs_symb_pos,
+                         uint16_t rnti,
                          const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config)
 {
   int16_t *llr_start = llr;
@@ -1565,9 +1587,15 @@ int pdsch_process_symbol(const c16_t *rxdataF,
   uint32_t csi_res_bitmap = build_csi_overlap_bitmap(dlsch_config, symbol);
 
   // DMRS RE bitmap
-  uint32_t dmrs_res_bitmap = 0;
+  uint16_t dmrs_res_bitmap = 0;
   if (IS_BIT_SET(dlsch_config->dlDmrsSymbPos, symbol))
     dmrs_res_bitmap = get_dmrs_re_bitmap(dlsch_config->dmrsConfigType, dlsch_config->n_dmrs_cdm_groups);
+
+  // PTRS RE bitmap staic info
+  const uint k_re_ref = dlsch_config->PTRSReOffset;
+  const uint k_ptrs = dlsch_config->PTRSFreqDensity;
+  AssertFatal(k_re_ref < NR_NB_SC_PER_RB, "Invalid k_re_ref\n");
+  const uint k_rb_ref = IS_BIT_SET(ptrs_symb_pos, symbol) ? get_ptrs_k_RB(freq_alloc->num_rbs, k_ptrs, rnti) : 0;
 
   int pos = 0;
   int block_start, block_end;
@@ -1577,12 +1605,23 @@ int pdsch_process_symbol(const c16_t *rxdataF,
 
     // Process one PRB
     for (int rb = start_rb; rb < start_rb + nb_rb; rb++) {
+      // PTRS RE bitmap
+      uint16_t ptrs_re_bitmap =
+          IS_BIT_SET(ptrs_symb_pos, symbol) ? get_ptrs_re_bitmap(rnti, nb_rb, rb, k_re_ref, k_ptrs, k_rb_ref) : 0;
+
       unsigned int rx_offset = rb * nb_rx * NR_NB_SC_PER_RB;
       unsigned int ch_offset = rb * nb_rx * nb_layer * NR_NB_SC_PER_RB;
-      uint32_t valid_re_mask = get_combined_valid_re_bitmap(rb, dmrs_res_bitmap, csi_res_bitmap);
+      uint16_t valid_re_mask = get_combined_valid_re_bitmap(rb, ptrs_re_bitmap, dmrs_res_bitmap, csi_res_bitmap);
 
-      int num_llr =
-          process_symbol_subband_sse(rxdataF + rx_offset, chest + ch_offset, llr, nvar, nb_rx, nb_layer, mod_order, valid_re_mask);
+      int num_llr = process_symbol_subband_sse(rxdataF + rx_offset,
+                                               chest + ch_offset,
+                                               cpe,
+                                               llr,
+                                               nvar,
+                                               nb_rx,
+                                               nb_layer,
+                                               mod_order,
+                                               valid_re_mask);
       llr += num_llr;
     }
   }
