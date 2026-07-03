@@ -261,6 +261,7 @@ int nr_rx_pdsch(PHY_VARS_NR_UE *ue,
 
 int pdsch_process_symbol(const c16_t *rxdataF,
                          const c16_t *chest,
+                         c16_t cpe,
                          int16_t *llr,
                          const freq_alloc_bitmap_t *freq_alloc,
                          uint8_t symbol,
@@ -269,6 +270,8 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                          unsigned int nb_rx,
                          unsigned int nb_layer,
                          uint32_t nvar,
+                         uint16_t ptrs_symb_pos,
+                         uint16_t rnti,
                          const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_config);
 
 int32_t generate_nr_prach(PHY_VARS_NR_UE *ue, uint8_t gNB_id, int frame, uint8_t slot, c16_t **txData);
