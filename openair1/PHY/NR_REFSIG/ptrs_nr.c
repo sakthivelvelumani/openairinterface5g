@@ -13,43 +13,38 @@
 *
 ************************************************************************/
 
+#include "assertions.h"
+#include "platform_types.h"
 #include <stdint.h>
 #include <stdio.h>
 #include "dmrs_nr.h"
 #include "PHY/NR_REFSIG/ptrs_nr.h"
+#include "PHY/TOOLS/tools_defs.h"
 #include "PHY/NR_REFSIG/nr_refsig.h"
 
 /*******************************************************************
-*
-* NAME :         set_ptrs_symb_idx
-*
-* PARAMETERS :   ptrs_symbols           PTRS OFDM symbol indicies bit mask
-*                duration_in_symbols    number of scheduled ofdm symbols
-*                start_symbol           first ofdm symbol within slot
-*                L_ptrs                 the parameter L_ptrs
-*                dmrs_symb_pos          bitmap of the time domain positions of the DMRS symbols
-*
-* RETURN :       sets the bit map of PTRS ofdm symbol indicies
-*
-* DESCRIPTION :  3GPP TS 38.211 6.4.1.2.2.1
-*
-*********************************************************************/
+ *
+ * NAME :         get_ptrs_symb_idx
+ *
+ * PARAMETERS :   duration_in_symbols    number of scheduled ofdm symbols
+ *                start_symbol           first ofdm symbol within slot
+ *                L_ptrs                 the parameter L_ptrs
+ *                dmrs_symb_pos          bitmap of the time domain positions of the DMRS symbols
+ *
+ * RETURN :       bit map of PTRS ofdm symbol indicies
+ *
+ * DESCRIPTION :  3GPP TS 38.211 6.4.1.2.2.1
+ *
+ *********************************************************************/
 
-void set_ptrs_symb_idx(uint16_t *ptrs_symbols,
-                       uint8_t duration_in_symbols,
-                       uint8_t start_symbol,
-                       uint8_t L_ptrs,
-                       uint16_t dmrs_symb_pos)
+uint16_t get_ptrs_symb_idx(uint8_t duration_in_symbols, uint8_t start_symbol, uint8_t L_ptrs, uint16_t dmrs_symb_pos)
 {
   int i = 0;
   int l_ref = start_symbol;
   const int last_symbol = start_symbol + duration_in_symbols - 1;
-  if (L_ptrs == 0) {
-    LOG_E(PHY,"bug: impossible L_ptrs\n");
-    *ptrs_symbols = 0;
-    return;
-  }
+  AssertFatal(L_ptrs > 0, "Impossible L_ptrs\n");
 
+  uint16_t ptrs_symbols = 0;
   while ((l_ref + i * L_ptrs) <= last_symbol) {
     int is_dmrs_symbol = 0, l_counter;
     for(l_counter = l_ref + i * L_ptrs; l_counter >= max(l_ref + (i - 1) * L_ptrs + 1, l_ref); l_counter--) {
@@ -63,9 +58,10 @@ void set_ptrs_symb_idx(uint16_t *ptrs_symbols,
       i = 1;
       continue;
     }
-    *ptrs_symbols = *ptrs_symbols | (1 << (l_ref + i * L_ptrs));
+    ptrs_symbols = ptrs_symbols | (1 << (l_ref + i * L_ptrs));
     i++;
   }
+  return ptrs_symbols;
 }
 
 unsigned int get_first_ptrs_re(const rnti_t rnti, const uint8_t K_ptrs, const uint16_t nRB, const uint8_t k_RE_ref)
@@ -73,6 +69,20 @@ unsigned int get_first_ptrs_re(const rnti_t rnti, const uint8_t K_ptrs, const ui
   const uint16_t nRB_Kptrs = nRB % K_ptrs;
   const uint16_t k_RB_ref = nRB_Kptrs ? (rnti % nRB_Kptrs) : (rnti % K_ptrs);
   return (k_RE_ref + k_RB_ref * NR_NB_SC_PER_RB);
+}
+
+/**
+ * @brief Returns k^{RB}_{ref} as per TS 38.211 6.4.1.2.2.1
+ *
+ * @param n_rb
+ * @param k_ptrs
+ * @param nrnti
+ * @return
+ */
+uint get_ptrs_k_RB(uint n_rb, uint k_ptrs, uint nrnti)
+{
+  DevAssert(k_ptrs > 0);
+  return (n_rb % k_ptrs) ? nrnti % (n_rb % k_ptrs) : nrnti % k_ptrs;
 }
 
 /*******************************************************************
@@ -152,6 +162,39 @@ int8_t get_next_estimate_in_slot(uint16_t  ptrsSymbPos,uint16_t  dmrsSymbPos, ui
   return (nextPtrs > nextDmrs)?nextDmrs:nextPtrs;
 }
 
+cd_t get_ptrs_phase_diff(const c16_t *rxF,
+                         const c16_t *chest,
+                         const uint32_t *gold_seq,
+                         uint k_ptrs,
+                         uint k_rb_ref,
+                         uint k_re_ref,
+                         uint n_rb)
+{
+  const uint shift = 15;
+  cd_t phase_diff = {0};
+  uint k_re = k_re_ref + k_rb_ref * NR_NB_SC_PER_RB;
+  uint i = 0;
+
+  while (k_re < n_rb * NR_NB_SC_PER_RB) {
+    // Get pilot symbol
+    const c16_t pilot = get_modulated(gold_seq, i++, true); // Already a conjugate
+
+    // Coherent complex correlation with DMRS estimates as reference:
+    const c16_t re_phase_diff = c16MulConjShift(chest[k_re], c16mulShift(rxF[k_re], pilot, shift), 9);
+
+    // Sum differences over REs
+    phase_diff.r += re_phase_diff.r;
+    phase_diff.i += re_phase_diff.i;
+
+    k_re += k_ptrs * NR_NB_SC_PER_RB;
+  }
+
+  // absolute calculation
+  const double abs = sqrt(((phase_diff.r * phase_diff.r) + (phase_diff.i * phase_diff.i)));
+  // normalized error estimation
+  return (cd_t){.r = phase_diff.r / abs, .i = phase_diff.i / abs};
+}
+
 /*******************************************************************
  *
  * NAME :         nr_ptrs_cpe_estimation
@@ -194,7 +237,7 @@ void nr_ptrs_cpe_estimation(uint8_t K_ptrs,
   c16_t dmrs_comp_p[(1 + sc_per_symbol / 4) * 4];
 
   /* generate PTRS RE for the symbol */
-  nr_gen_ref_conj_symbols(gold_seq, sc_per_symbol * 2, (int16_t *)ptrs_p, 2); // 2 for QPSK
+  nr_gen_ref_conj_symbols(gold_seq, sc_per_symbol, ptrs_p); // 2 for QPSK
   uint32_t re_cnt = 0, cnt = 0;
   /* loop over all sub carriers to get compensated RE on ptrs symbols*/
   for (int re = 0; re < NR_NB_SC_PER_RB * nb_rb; re++) {
@@ -342,4 +385,17 @@ void ptrs_estimate_from_slope(int16_t *error_est, double *slope_p, uint8_t start
            slope_p[0],slope_p[1]);
 #endif
   }
+}
+
+double get_interpolate_step_phase(cd_t start_vector, cd_t end_vector, uint dist)
+{
+  const cd_t d = cdMulConj(start_vector, end_vector);
+  const double d_theta_step = atan2(d.i, d.r) / dist;
+  return d_theta_step;
+}
+
+cd_t add_cpx_phasor(cd_t base_vector, double phase)
+{
+  const cd_t incr = (cd_t){.r = cos(phase), .i = sin(phase)};
+  return cdMul(base_vector, incr);
 }
