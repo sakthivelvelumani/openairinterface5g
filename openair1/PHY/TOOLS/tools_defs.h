@@ -242,6 +242,18 @@ extern "C" {
     return (cd_t){.r = a.r * b.r + a.i * b.i, .i = a.r * b.i - a.i * b.r};
   }
 
+  __attribute__((always_inline)) inline cd_t cdNorm(const cd_t a)
+  {
+    const double abs = sqrt(a.r * a.r + a.i * a.i);
+    return (cd_t){.r = a.r / abs, .i = a.i / abs};
+  }
+
+  __attribute__((always_inline)) inline c16_t cd2c16(const cd_t a, const int16_t amp)
+  {
+    const cd_t n = cdNorm(a);
+    return (c16_t){.r = (int16_t)(n.r * amp), .i = (int16_t)(n.i * amp)};
+  }
+
   // On N complex numbers
   //   y.r += (x * alpha.r) >> 14
   //   y.i += (x * alpha.i) >> 14

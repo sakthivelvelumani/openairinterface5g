@@ -16,11 +16,18 @@
 #ifndef PTRS_NR_H
 #define PTRS_NR_H
 
-void set_ptrs_symb_idx(uint16_t *ptrs_symbols,
-                       uint8_t duration_in_symbols,
-                       uint8_t start_symbol,
-                       uint8_t L_ptrs,
-                       uint16_t dmrs_symb_pos);
+#include <sys/types.h>
+#include <platform_types.h>
+
+cd_t get_ptrs_phase_diff(const c16_t *rxF,
+                         const c16_t *chest,
+                         const uint32_t *gold_seq,
+                         uint k_ptrs,
+                         uint k_rb_ref,
+                         uint k_re_ref,
+                         uint n_rb);
+uint get_ptrs_k_RB(uint n_rb, uint k_ptrs, uint nrnti);
+uint16_t get_ptrs_symb_idx(uint8_t duration_in_symbols, uint8_t start_symbol, uint8_t L_ptrs, uint16_t dmrs_symb_pos);
 
 unsigned int get_first_ptrs_re(const rnti_t rnti, const uint8_t K_ptrs, const uint16_t nRB, const uint8_t k_RE_ref);
 
@@ -70,4 +77,6 @@ void nr_ptrs_cpe_estimation(uint8_t K_ptrs,
 
 void get_slope_from_estimates(uint8_t start, uint8_t end, int16_t *est_p, double *slope_p);
 void ptrs_estimate_from_slope(int16_t *error_est, double *slope_p, uint8_t start, uint8_t end);
+double get_interpolate_step_phase(cd_t start_phase, cd_t end_phase, uint dist);
+cd_t add_cpx_phasor(cd_t base_vector, double phase);
 #endif /* PTRS_NR_H */
