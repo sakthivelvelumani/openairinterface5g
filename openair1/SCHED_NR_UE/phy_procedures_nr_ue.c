@@ -435,19 +435,6 @@ static void nr_ue_measurement_procedures(uint16_t l,
   }
 }
 
-static void fftshift(c16_t *in, int nbins, int fft_size)
-{
-  const int neg = nbins / 2; // # negative-freq bins
-  c16_t tmp[fft_size / 2]; // holds the negative half
-
-  // save negative bins (they sit at the tail: indices N-neg .. N-1)
-  memcpy(tmp, in + fft_size - neg, neg * sizeof(c16_t));
-  // slide DC + positive (and trailing zeros) to the right by neg
-  memmove(in + neg, in, (fft_size - neg) * sizeof(c16_t));
-  // place negative bins at the front
-  memcpy(in, tmp, neg * sizeof(c16_t));
-}
-
 static void buffer_relayout(const c16_t *in,
                             int in_size,
                             c16_t *out,
@@ -481,7 +468,7 @@ static void buffer_relayout_rxdataF_chest(const NR_DL_FRAME_PARMS *fp,
 {
   // Relayout buffer to process in groups of two PRBs
   buffer_relayout((const c16_t *)rxdataF,
-                  fp->samples_per_slot_wCP,
+                  fp->ofdm_symbol_size,
                   rxdataF_proc,
                   NR_NB_SC_PER_RB,
                   1,
@@ -557,6 +544,7 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
   double step_phase = 0.0;
   int16_t *symbol_llr = llr;
   while (symbol <= last_symbol) {
+    c16_t rxF[nb_rx][ofdm_size] __attribute__((aligned(32)));
     if (IS_BIT_SET(ptrs_symb_pos, symbol)) {
       if (last_processed_ptrs != symbol) {
         // process ptrs, get phase wrt to dmrs
@@ -564,8 +552,9 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
         const uint32_t *gold_seq =
             nr_gold_pdsch(fp->N_RB_DL, fp->symbols_per_slot, fp->Nid_cell, dlschCfg->nscid, proc->nr_slot_rx, symbol);
         // FFT shift rxdataF
-        fftshift(rxdataF[0] + symbol * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
-        base_phase = get_ptrs_phase_diff(rxdataF[0] + symbol * fp->ofdm_symbol_size,
+        for (uint aarx = 0; aarx < nb_rx; aarx++)
+          fftshift(rxdataF[aarx] + symbol * fp->ofdm_symbol_size, rxF[aarx], fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+        base_phase = get_ptrs_phase_diff(rxF[0],
                                          (const c16_t *)chest[0],
                                          gold_seq,
                                          dlschCfg->PTRSFreqDensity,
@@ -579,7 +568,7 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
       // process pdsch
       pdsch_cpe = cd2c16(add_cpx_phasor(base_phase, 0), amp);
       // Generate LLRs for one symbol
-      buffer_relayout_rxdataF_chest(fp, rxdataF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, symbol);
+      buffer_relayout_rxdataF_chest(fp, rxF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, 0);
       const int llr_count = pdsch_process_symbol(rxdataF_proc,
                                                  (const c16_t *)chest_proc,
                                                  pdsch_cpe,
@@ -626,8 +615,9 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
       // process pdsch
       // Generate LLRs for one symbol
       // FFT shift rxdataF
-      fftshift(rxdataF[0] + symbol * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
-      buffer_relayout_rxdataF_chest(fp, rxdataF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, symbol);
+      for (uint aarx = 0; aarx < nb_rx; aarx++)
+        fftshift(rxdataF[aarx] + symbol * fp->ofdm_symbol_size, rxF[aarx], fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+      buffer_relayout_rxdataF_chest(fp, rxF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, 0);
       const int llr_count = pdsch_process_symbol(rxdataF_proc,
                                                  (const c16_t *)chest_proc,
                                                  pdsch_cpe,
@@ -663,8 +653,12 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
             // process ptrs, get phase wrt to dmrs
             const uint32_t *gold_seq =
                 nr_gold_pdsch(fp->N_RB_DL, fp->symbols_per_slot, fp->Nid_cell, dlschCfg->nscid, proc->nr_slot_rx, next_ref);
-            fftshift(rxdataF[0] + next_ref * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
-            next_base_phase = get_ptrs_phase_diff(rxdataF[0] + next_ref * ofdm_size,
+            for (uint aarx = 0; aarx < nb_rx; aarx++)
+              fftshift(rxdataF[aarx] + next_ref * fp->ofdm_symbol_size,
+                       rxF[aarx],
+                       fp->N_RB_DL * NR_NB_SC_PER_RB,
+                       fp->ofdm_symbol_size);
+            next_base_phase = get_ptrs_phase_diff(rxF[0],
                                                   (const c16_t *)chest[0],
                                                   gold_seq,
                                                   dlschCfg->PTRSFreqDensity,
@@ -683,8 +677,9 @@ static int nr_ue_pdsch_procedures_lite(PHY_VARS_NR_UE *ue,
       pdsch_cpe = cd2c16(add_cpx_phasor(base_phase, step_phase * num_steps), amp);
       // process pdsch
       // Generate LLRs for one symbol
-      fftshift(rxdataF[0] + symbol * fp->ofdm_symbol_size, fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
-      buffer_relayout_rxdataF_chest(fp, rxdataF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, symbol);
+      for (uint aarx = 0; aarx < nb_rx; aarx++)
+        fftshift(rxdataF[aarx] + symbol * fp->ofdm_symbol_size, rxF[aarx], fp->N_RB_DL * NR_NB_SC_PER_RB, fp->ofdm_symbol_size);
+      buffer_relayout_rxdataF_chest(fp, rxF, rxdataF_proc, (const c16_t *)chest[0], chest_proc, nb_rx, nl, 0);
       const int llr_count = pdsch_process_symbol(rxdataF_proc,
                                                  (const c16_t *)chest_proc,
                                                  pdsch_cpe,
