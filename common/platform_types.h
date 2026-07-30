@@ -5,6 +5,7 @@
 #ifndef __PLATFORM_TYPES_H__
 #define __PLATFORM_TYPES_H__
 
+#include <simde/x86/sse.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -20,6 +21,13 @@ typedef struct complexf {
   float r;
   float i;
 } cf_t;
+
+typedef _Float16 float16_t;
+
+typedef struct complexhp {
+  float16_t r;
+  float16_t i;
+} ch_t;
 
 typedef struct complex8 {
   int8_t r;

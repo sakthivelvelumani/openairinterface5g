@@ -254,6 +254,11 @@ extern "C" {
     return (c16_t){.r = (int16_t)(n.r * amp), .i = (int16_t)(n.i * amp)};
   }
 
+  __attribute__((always_inline)) inline ch_t c16_to_ch(const c16_t a)
+  {
+    return (ch_t){.r = (float16_t)((float)a.r / 32768.0f), .i = (float16_t)((float)a.i / 32768.0f)};
+  }
+
   // On N complex numbers
   //   y.r += (x * alpha.r) >> 14
   //   y.i += (x * alpha.i) >> 14
