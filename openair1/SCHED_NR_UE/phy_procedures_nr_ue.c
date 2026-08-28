@@ -477,7 +477,7 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
     }
   }
   stop_meas_nr_ue_phy(ue, DLSCH_CHANNEL_ESTIMATION_STATS);
-  nvar /= (dlschCfg->number_symbols * dlsch->cw_info.Nl * ue->frame_parms.nb_antennas_rx);
+  nvar /= (__builtin_popcount(dlschCfg->dlDmrsSymbPos) * dlsch->cw_info.Nl * ue->frame_parms.nb_antennas_rx);
   uint32_t dmrs_mask = dlschCfg->dlDmrsSymbPos;
   int first_dmrs_symbol = get_first_bit_index_mask(&dmrs_mask, 1, 0, NR_SYMBOLS_PER_SLOT);
   nr_ue_measurement_procedures(first_dmrs_symbol, ue, proc, freq_alloc->num_rbs, pdsch_est_size, pdsch_dl_ch_estimates);
