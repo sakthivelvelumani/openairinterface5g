@@ -1509,6 +1509,22 @@ static inline void nr_qpsk_llr_float(const cf_t *in, const uint len, int16_t *ou
   }
 }
 
+// y = conj(a0) * b0 + conj(a1) * b1, componentwise over the 12 REs of one RB. This is the shape of
+// every term of H^H * y and of H^H * H for 2 receive antennas. y must not alias any of the inputs.
+static inline void sum_conj_mult_2_ant(const simde__m256 *a0,
+                                       const simde__m256 *b0,
+                                       const simde__m256 *a1,
+                                       const simde__m256 *b1,
+                                       simde__m256 *y)
+{
+  simde__m256 t[NUM_AVX2_VECT];
+  mult_conj_cf_vector((const cf_t *)a0, (const cf_t *)b0, (cf_t *)y, NR_NB_SC_PER_RB);
+  mult_conj_cf_vector((const cf_t *)a1, (const cf_t *)b1, (cf_t *)t, NR_NB_SC_PER_RB);
+  for (uint i = 0; i < NUM_AVX2_VECT; i++)
+    y[i] = simde_mm256_add_ps(y[i], t[i]);
+}
+
+
 static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
                                                     const c16_t *rxdataF1,
                                                     const c16_t *chest0,
@@ -1536,90 +1552,109 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   //
   //   y = y0
   //       y1
+  // One RB is 12 REs, i.e. exactly NUM_AVX2_VECT vectors of 4 complex floats, so the cf_t kernels
+  // used from here on run over a whole RB, or over both antennas of one RB, in one call
+  AssertFatal(4 * NUM_AVX2_VECT == NR_NB_SC_PER_RB, "a RB does not fit in NUM_AVX2_VECT vectors");
+
+  // The fixed point samples are normalized by the RMS amplitude of the channel estimate, which
+  // keeps the Gram matrix and its Cholesky factor in a range where float precision is comfortable
+  const float cvt_divisor = sqrt((double)avg / 2);
   simde__m256 chest_ps0[2 * NUM_AVX2_VECT];
   simde__m256 chest_ps1[2 * NUM_AVX2_VECT];
-  const simde__m256 cvt_divisor = simde_mm256_set1_ps(sqrt((double)avg / 2));
-  for (uint i = 0; i < 2 * NUM_AVX2_VECT; i++) {
-    chest_ps0[i] = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(((simde__m128i *)chest0)[i]));
-    chest_ps0[i] = simde_mm256_div_ps(chest_ps0[i], *(simde__m256 *)&cvt_divisor);
-    chest_ps1[i] = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(((simde__m128i *)chest1)[i]));
-    chest_ps1[i] = simde_mm256_div_ps(chest_ps1[i], *(simde__m256 *)&cvt_divisor);
-  }
+  c16_to_cf_vector(chest0, (cf_t *)chest_ps0, 2 * NR_NB_SC_PER_RB, cvt_divisor);
+  c16_to_cf_vector(chest1, (cf_t *)chest_ps1, 2 * NR_NB_SC_PER_RB, cvt_divisor);
 
   simde__m256 rxf_ps0[NUM_AVX2_VECT];
   simde__m256 rxf_ps1[NUM_AVX2_VECT];
-  for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    rxf_ps0[i] = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(((simde__m128i *)rxdataF0)[i]));
-    rxf_ps0[i] = simde_mm256_div_ps(rxf_ps0[i], *(simde__m256 *)&cvt_divisor);
-    rxf_ps1[i] = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(((simde__m128i *)rxdataF1)[i]));
-    rxf_ps1[i] = simde_mm256_div_ps(rxf_ps1[i], *(simde__m256 *)&cvt_divisor);
-  }
+  c16_to_cf_vector(rxdataF0, (cf_t *)rxf_ps0, NR_NB_SC_PER_RB, cvt_divisor);
+  c16_to_cf_vector(rxdataF1, (cf_t *)rxf_ps1, NR_NB_SC_PER_RB, cvt_divisor);
 
-  //   H^H * y = h00*y0 + h10*y1
-  //             h01*y0 + h11*y1
+  //   H^H * y = conj(h00)*y0 + conj(h10)*y1
+  //             conj(h01)*y0 + conj(h11)*y1
   simde__m256 comp0[NUM_AVX2_VECT];
   simde__m256 comp1[NUM_AVX2_VECT];
+  sum_conj_mult_2_ant(chest_ps0, rxf_ps0, chest_ps0 + NUM_AVX2_VECT, rxf_ps1, comp0);
+  sum_conj_mult_2_ant(chest_ps1, rxf_ps0, chest_ps1 + NUM_AVX2_VECT, rxf_ps1, comp1);
+
+  // G = H^H * H = |h00|^2 + |h10|^2   g01
+  //               conj(g01)           |h01|^2 + |h11|^2
+  // gram0 holds the first row of G, gram1 the second one. G is Hermitian, so the lower off-diagonal
+  // is derived from the upper one rather than computed again: that is cheaper, and it makes G
+  // exactly Hermitian, which the Cholesky decomposition below assumes.
+  simde__m256 gram0[2 * NUM_AVX2_VECT];
+  simde__m256 gram1[2 * NUM_AVX2_VECT];
+  sum_conj_mult_2_ant(chest_ps0, chest_ps0, chest_ps0 + NUM_AVX2_VECT, chest_ps0 + NUM_AVX2_VECT, gram0);
+  sum_conj_mult_2_ant(chest_ps0, chest_ps1, chest_ps0 + NUM_AVX2_VECT, chest_ps1 + NUM_AVX2_VECT, gram0 + NUM_AVX2_VECT);
+  sum_conj_mult_2_ant(chest_ps1, chest_ps1, chest_ps1 + NUM_AVX2_VECT, chest_ps1 + NUM_AVX2_VECT, gram1 + NUM_AVX2_VECT);
   const simde__m256 conj_mask = simde_mm256_castsi256_ps(simde_mm256_set_epi32(-1, 0, -1, 0, -1, 0, -1, 0));
   const simde__m256 signflip = simde_mm256_and_ps(conj_mask, simde_mm256_set1_ps(-0.0f));
   for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    comp0[i] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i], signflip), rxf_ps0[i]);
-    comp0[i] =
-        simde_mm256_add_ps(comp0[i], simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i + NUM_AVX2_VECT], signflip), rxf_ps1[i]));
-    comp1[i] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i], signflip), rxf_ps0[i]);
-    comp1[i] =
-        simde_mm256_add_ps(comp1[i], simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i + NUM_AVX2_VECT], signflip), rxf_ps1[i]));
-  }
-
-  // G = H^H * H = magsqr(h00) + magsqr(h10)        conj(h00)*h01 + conj(h01)*h11
-  //               conj(h01)*h00 + conj(h11)*h10    magsqr(h01) + magsqr(h11)
-  simde__m256 gram0[2 * NUM_AVX2_VECT];
-  simde__m256 gram1[2 * NUM_AVX2_VECT];
-  for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    gram0[i] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i], signflip), chest_ps0[i]);
-    simde__m256 b2 = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i + NUM_AVX2_VECT], signflip), chest_ps0[i + NUM_AVX2_VECT]);
-    gram0[i] = simde_mm256_add_ps(gram0[i], b2);
-
-    gram0[i + NUM_AVX2_VECT] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i], signflip), chest_ps1[i]);
-    b2 = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps0[i + NUM_AVX2_VECT], signflip), chest_ps1[i + NUM_AVX2_VECT]);
-    gram0[i + NUM_AVX2_VECT] = simde_mm256_add_ps(gram0[i + NUM_AVX2_VECT], b2);
-
-    gram1[i] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i], signflip), chest_ps0[i]);
-    b2 = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i + NUM_AVX2_VECT], signflip), chest_ps0[i + NUM_AVX2_VECT]);
-    gram1[i] = simde_mm256_add_ps(gram1[i], b2);
-
-    gram1[i + NUM_AVX2_VECT] = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i], signflip), chest_ps1[i]);
-    b2 = simde_mm256_mul_ps(simde_mm256_xor_ps(chest_ps1[i + NUM_AVX2_VECT], signflip), chest_ps1[i + NUM_AVX2_VECT]);
-    gram1[i] = simde_mm256_add_ps(gram1[i + NUM_AVX2_VECT], b2);
+    gram1[i] = simde_mm256_xor_ps(gram0[i + NUM_AVX2_VECT], signflip); // g10 = conj(g01)
+    // |h|^2 is real, but the FMA inside the conjugate product leaves the rounding error of h.r*h.i
+    // in the imaginary part; clearing it keeps the diagonal of G, and with it that of L, real
+    gram0[i] = simde_mm256_andnot_ps(conj_mask, gram0[i]);
+    gram1[i + NUM_AVX2_VECT] = simde_mm256_andnot_ps(conj_mask, gram1[i + NUM_AVX2_VECT]);
   }
 
   // Cholesky decomposition
+  //   G = L * L^H with L = l00   0
+  //                     l10  l11
+  // l0 holds l00, the two halves of l1 hold l10 and l11. Both diagonal elements are real.
   simde__m256 l0[NUM_AVX2_VECT];
   simde__m256 l1[2 * NUM_AVX2_VECT];
-  for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    l0[i] = simde_mm256_sqrt_ps(gram0[i]);
-    l1[i] = simde_mm256_div_ps(gram1[i], l0[i]);
-    const simde__m256 s = simde_mm256_mul_ps(simde_mm256_xor_ps(l1[i], signflip), l1[i]);
-    l1[i + NUM_AVX2_VECT] = simde_mm256_sqrt_ps(simde_mm256_sub_ps(gram1[i + NUM_AVX2_VECT], s));
+  {
+    // l00 = sqrt(g00)
+    sqrt_cf_vector((const cf_t *)gram0, (cf_t *)l0, NR_NB_SC_PER_RB);
+
+    // l10 = g10 / l00
+    div_cf_vector((const cf_t *)gram1, (const cf_t *)l0, (cf_t *)l1, NR_NB_SC_PER_RB);
+
+    // l11 = sqrt(g11 - |l10|^2), where conj(l10) * l10 gives |l10|^2
+    simde__m256 s[NUM_AVX2_VECT];
+    mult_conj_cf_vector((const cf_t *)l1, (const cf_t *)l1, (cf_t *)s, NR_NB_SC_PER_RB);
+    for (uint i = 0; i < NUM_AVX2_VECT; i++)
+      s[i] = simde_mm256_sub_ps(gram1[i + NUM_AVX2_VECT], s[i]); // complex subtraction is componentwise
+    sqrt_cf_vector((const cf_t *)s, (cf_t *)(l1 + NUM_AVX2_VECT), NR_NB_SC_PER_RB);
   }
 
   // Forward substitution
-  // L * z = H^H * y
+  //   L * z = H^H * y
   simde__m256 z0[NUM_AVX2_VECT];
   simde__m256 z1[NUM_AVX2_VECT];
-  for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    z0[i] = simde_mm256_div_ps(comp0[i], l0[i]);
-    const simde__m256 d = simde_mm256_sub_ps(comp1[i], simde_mm256_mul_ps(l1[i], z0[i]));
-    z1[i] = simde_mm256_div_ps(d, l1[i + NUM_AVX2_VECT]);
+  {
+    // z0 = (H^H * y)0 / l00
+    div_cf_vector((const cf_t *)comp0, (const cf_t *)l0, (cf_t *)z0, NR_NB_SC_PER_RB);
+
+    // z1 = ((H^H * y)1 - l10 * z0) / l11
+    simde__m256 d[NUM_AVX2_VECT];
+    mult_cf_vector((const cf_t *)l1, (const cf_t *)z0, (cf_t *)d, NR_NB_SC_PER_RB);
+    for (uint i = 0; i < NUM_AVX2_VECT; i++)
+      d[i] = simde_mm256_sub_ps(comp1[i], d[i]);
+    div_cf_vector((const cf_t *)d, (const cf_t *)(l1 + NUM_AVX2_VECT), (cf_t *)z1, NR_NB_SC_PER_RB);
   }
 
   // Backward substitution
-  // L^H * x = z
+  //   L^H * x = z, i.e. conj(l00) * x0 + conj(l10) * x1 = z0
+  //                                      conj(l11) * x1 = z1
+  // Conjugating the diagonal is a no-op as long as the Gram matrix is exactly Hermitian, it is kept
+  // so that a residual imaginary part on the diagonal cannot leak into the result.
   simde__m256 x0[NUM_AVX2_VECT];
   simde__m256 x1[NUM_AVX2_VECT];
-  for (uint i = 0; i < NUM_AVX2_VECT; i++) {
-    x1[i] = simde_mm256_div_ps(z1[i], simde_mm256_xor_ps(l1[i + NUM_AVX2_VECT], signflip));
-    const simde__m256 d = simde_mm256_sub_ps(z0[i], simde_mm256_mul_ps(simde_mm256_xor_ps(l1[i], signflip), x1[i]));
-    x0[i] = simde_mm256_div_ps(d, simde_mm256_xor_ps(l1[i], signflip));
+  {
+    // x1 = z1 / conj(l11)
+    simde__m256 diag[NUM_AVX2_VECT];
+    for (uint i = 0; i < NUM_AVX2_VECT; i++)
+      diag[i] = simde_mm256_xor_ps(l1[i + NUM_AVX2_VECT], signflip);
+    div_cf_vector((const cf_t *)z1, (const cf_t *)diag, (cf_t *)x1, NR_NB_SC_PER_RB);
+
+    // x0 = (z0 - conj(l10) * x1) / conj(l00)
+    simde__m256 d[NUM_AVX2_VECT];
+    mult_conj_cf_vector((const cf_t *)l1, (const cf_t *)x1, (cf_t *)d, NR_NB_SC_PER_RB);
+    for (uint i = 0; i < NUM_AVX2_VECT; i++) {
+      d[i] = simde_mm256_sub_ps(z0[i], d[i]);
+      diag[i] = simde_mm256_xor_ps(l0[i], signflip);
+    }
+    div_cf_vector((const cf_t *)d, (const cf_t *)diag, (cf_t *)x0, NR_NB_SC_PER_RB);
   }
 
   // Group valid REs: extraction
