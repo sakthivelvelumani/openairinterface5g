@@ -43,6 +43,12 @@ add_dependencies(tests test_cf_sqrt)
 add_test(NAME test_cf_sqrt
   COMMAND ./test_cf_sqrt)
 
+add_executable(test_c16_to_cf test_c16_to_cf.cpp)
+target_link_libraries(test_c16_to_cf PRIVATE GTest::gtest LOG minimal_lib m)
+add_dependencies(tests test_c16_to_cf)
+add_test(NAME test_c16_to_cf
+  COMMAND ./test_c16_to_cf)
+
 add_executable(test_cf_mul_div test_cf_mul_div.cpp)
 target_link_libraries(test_cf_mul_div PRIVATE GTest::gtest LOG minimal_lib m)
 add_dependencies(tests test_cf_mul_div)

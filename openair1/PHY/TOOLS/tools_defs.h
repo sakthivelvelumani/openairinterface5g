@@ -260,6 +260,15 @@ extern "C" {
     return (ch_t){.r = (float16_t)((float)a.r / 32768.0f), .i = (float16_t)((float)a.i / 32768.0f)};
   }
 
+  /*! \brief Convert one fixed point complex sample to a complex float, dividing it by scale
+
+  Pass 32768 as scale to normalize a Q15 sample to [-1, 1[, as c16_to_ch() does.
+  */
+  __attribute__((always_inline)) static inline cf_t c16_to_cf(const c16_t a, const float scale)
+  {
+    return (cf_t){.r = a.r / scale, .i = a.i / scale};
+  }
+
   // On N complex numbers
   //   y.r += (x * alpha.r) >> 14
   //   y.i += (x * alpha.i) >> 14
@@ -926,6 +935,30 @@ static inline int32_t sub_cpx_vector16(const c16_t *x, const c16_t *y, c16_t *z,
   for (uint32_t i = 0; i < (N >> 3); i++)
     z_128[i] = simde_mm_subs_epi16(x_128[i], y_128[i]);
   return (0);
+}
+
+/*!\fn void c16_to_cf_vector(const c16_t *x, cf_t *y, uint32_t N, float scale)
+\brief Convert a fixed point complex vector to complex floats, dividing them by scale
+
+@param x Vector input in the format |Re0 Im0|,...,|Re(N-1) Im(N-1)|
+@param y Vector output, twice the size of x, must not overlap it
+@param N Number of complex elements of x
+@param scale Divisor applied to every element, e.g. 32768 to normalize Q15 samples to [-1, 1[
+
+The function implemented is : \f$y_i = x_i / scale\f$
+*/
+static inline void c16_to_cf_vector(const c16_t *x, cf_t *y, const uint32_t N, const float scale)
+{
+  const simde__m256 divisor = simde_mm256_set1_ps(scale);
+
+  uint32_t i = 0;
+  // 4 complex elements per iteration: one 128 bit load of int16 widens to a 256 bit float vector
+  for (; i + 4 <= N; i += 4) {
+    const simde__m256i wide = simde_mm256_cvtepi16_epi32(simde_mm_loadu_si128((const simde__m128i *)(x + i)));
+    simde_mm256_storeu_ps((float *)(y + i), simde_mm256_div_ps(simde_mm256_cvtepi32_ps(wide), divisor));
+  }
+  for (; i < N; i++)
+    y[i] = c16_to_cf(x[i], scale);
 }
 
 /*! \brief Load 8 complex floats and separate them into a real and an imaginary vector
