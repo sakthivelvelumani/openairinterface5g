@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <assert.h>
+#include <math.h>
 #include "common/platform_types.h"
 #include "PHY/sse_intrin.h"
 
@@ -925,6 +926,97 @@ static inline int32_t sub_cpx_vector16(const c16_t *x, const c16_t *y, c16_t *z,
   for (uint32_t i = 0; i < (N >> 3); i++)
     z_128[i] = simde_mm_subs_epi16(x_128[i], y_128[i]);
   return (0);
+}
+
+/*!\fn cf_t cf_sqrt(cf_t x)
+\brief Principal (single-valued) square root of one complex float number
+
+The principal square root is the one lying in the right half plane, i.e. the result has a
+non-negative real part, and its imaginary part carries the sign of the input imaginary part.
+This matches the definition of C99 csqrtf() for finite inputs.
+
+@param x Complex input
+@returns \f$\sqrt{x}\f$
+*/
+static inline cf_t cf_sqrt(const cf_t x)
+{
+  // sqrt(x) = t + i * x.i / (2 * t) with t = sqrt((|x| + x.r) / 2)
+  // Computing t from |x.r| instead of x.r avoids the cancellation of |x| + x.r for x.r < 0.
+  // The formulas for the two half planes are then mirrored to keep the real part non-negative.
+  const float mag = hypotf(x.r, x.i);
+  if (mag == 0.0f) // covers x == 0, the only case where t would be 0
+    return (cf_t){0.0f, x.i}; // keep sign of a signed zero imaginary part, as csqrtf() does
+  const float t = sqrtf(0.5f * (mag + fabsf(x.r)));
+  if (x.r >= 0.0f)
+    return (cf_t){t, 0.5f * x.i / t};
+  else
+    return (cf_t){0.5f * fabsf(x.i) / t, copysignf(t, x.i)};
+}
+
+/*!\fn void sqrt_cf_vector(const cf_t *x, cf_t *y, uint32_t N)
+\brief Componentwise principal square root of a complex float vector
+
+Same result as calling cf_sqrt() on each element, up to a last bit difference: the magnitude of the
+input is computed without hypotf() here. Inputs whose magnitude overflows the float range are not
+supported (hypotf() does not support them either).
+
+@param x Vector input in the format |Re0 Im0|,...,|Re(N-1) Im(N-1)|
+@param y Vector output, may be x for an in place computation, must not partially overlap x
+@param N Number of complex elements of x
+
+The function implemented is : \f$y_i = \sqrt{x_i}\f$
+*/
+static inline void sqrt_cf_vector(const cf_t *x, cf_t *y, const uint32_t N)
+{
+  const simde__m256 sign = simde_mm256_set1_ps(-0.0f); // sign bit only, used to mask/copy signs
+  const simde__m256 half = simde_mm256_set1_ps(0.5f);
+  const simde__m256 one = simde_mm256_set1_ps(1.0f);
+  const simde__m256 zero = simde_mm256_setzero_ps();
+
+  uint32_t i = 0;
+  for (; i + 8 <= N; i += 8) {
+    // Separate 8 complex elements into a real and an imaginary vector. Both come out in a permuted
+    // element order, which does not matter for a componentwise operation, and the unpack at the end
+    // undoes the permutation.
+    const simde__m256 a = simde_mm256_loadu_ps((const float *)(x + i));
+    const simde__m256 b = simde_mm256_loadu_ps((const float *)(x + i + 4));
+    const simde__m256 re = simde_mm256_shuffle_ps(a, b, 0x88);
+    const simde__m256 im = simde_mm256_shuffle_ps(a, b, 0xDD);
+
+    const simde__m256 abs_re = simde_mm256_andnot_ps(sign, re);
+    const simde__m256 abs_im = simde_mm256_andnot_ps(sign, im);
+
+    // |x| = amax * sqrt(1 + (amin / amax)^2), an overflow free replacement of hypotf()
+    const simde__m256 amax = simde_mm256_max_ps(abs_re, abs_im);
+    const simde__m256 amin = simde_mm256_min_ps(abs_re, abs_im);
+    const simde__m256 q = simde_mm256_div_ps(amin, amax); // 0 / 0 == NaN for x == 0, replaced below
+    const simde__m256 is_zero = simde_mm256_cmp_ps(amax, zero, SIMDE_CMP_EQ_OQ); // x == 0
+    const simde__m256 mag =
+        simde_mm256_blendv_ps(simde_mm256_mul_ps(amax, simde_mm256_sqrt_ps(simde_mm256_fmadd_ps(q, q, one))),
+                              zero,
+                              is_zero);
+
+    // t = sqrt((|x| + |x.r|) / 2) is the larger of the two components of the result, see cf_sqrt()
+    const simde__m256 t = simde_mm256_sqrt_ps(simde_mm256_mul_ps(half, simde_mm256_add_ps(mag, abs_re)));
+
+    // right half plane: t + i * x.i / (2 * t), left half plane: |x.i| / (2 * t) + i * sign(x.i) * t
+    const simde__m256 pos_im = simde_mm256_div_ps(simde_mm256_mul_ps(half, im), t);
+    const simde__m256 neg_re = simde_mm256_div_ps(simde_mm256_mul_ps(half, abs_im), t);
+    const simde__m256 neg_im = simde_mm256_or_ps(t, simde_mm256_and_ps(sign, im)); // copysignf(t, x.i)
+    const simde__m256 is_neg = simde_mm256_cmp_ps(re, zero, SIMDE_CMP_LT_OQ); // false for -0.0, as in cf_sqrt()
+    simde__m256 out_re = simde_mm256_blendv_ps(t, neg_re, is_neg);
+    simde__m256 out_im = simde_mm256_blendv_ps(pos_im, neg_im, is_neg);
+
+    // x == 0 is the only input giving t == 0, i.e. the only one where the divisions above are 0 / 0
+    out_re = simde_mm256_blendv_ps(out_re, zero, is_zero);
+    out_im = simde_mm256_blendv_ps(out_im, im, is_zero); // keeps a signed zero, as cf_sqrt() does
+
+    // interleave the result back, undoing the permutation of the loads
+    simde_mm256_storeu_ps((float *)(y + i), simde_mm256_unpacklo_ps(out_re, out_im));
+    simde_mm256_storeu_ps((float *)(y + i + 4), simde_mm256_unpackhi_ps(out_re, out_im));
+  }
+  for (; i < N; i++)
+    y[i] = cf_sqrt(x[i]);
 }
 
 /*!\fn int32_t signal_energy(int *,uint32_t);

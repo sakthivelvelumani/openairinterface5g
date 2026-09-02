@@ -37,6 +37,12 @@ add_dependencies(tests test_oai_arith_operations)
 add_test(NAME test_oai_arith_operations
   COMMAND ./test_oai_arith_operations)
 
+add_executable(test_cf_sqrt test_cf_sqrt.cpp)
+target_link_libraries(test_cf_sqrt PRIVATE GTest::gtest LOG minimal_lib m)
+add_dependencies(tests test_cf_sqrt)
+add_test(NAME test_cf_sqrt
+  COMMAND ./test_cf_sqrt)
+
 add_executable(test_sse_intrinsics test_sse_intrinsics.cpp)
 target_link_libraries(test_sse_intrinsics PRIVATE GTest::gtest LOG minimal_lib)
 add_dependencies(tests test_sse_intrinsics)
