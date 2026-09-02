@@ -928,6 +928,28 @@ static inline int32_t sub_cpx_vector16(const c16_t *x, const c16_t *y, c16_t *z,
   return (0);
 }
 
+/*! \brief Load 8 complex floats and separate them into a real and an imaginary vector
+
+The element order inside the two vectors is permuted, which does not matter for a componentwise
+operation, and cf_interleave() undoes the permutation.
+*/
+static inline void cf_deinterleave(const cf_t *x, simde__m256 *re, simde__m256 *im)
+{
+  const simde__m256 a = simde_mm256_loadu_ps((const float *)x);
+  const simde__m256 b = simde_mm256_loadu_ps((const float *)(x + 4));
+  *re = simde_mm256_shuffle_ps(a, b, 0x88);
+  *im = simde_mm256_shuffle_ps(a, b, 0xDD);
+}
+
+/*! \brief Interleave a real and an imaginary vector back into 8 complex floats, undoing the
+element permutation of cf_deinterleave()
+*/
+static inline void cf_interleave(const simde__m256 re, const simde__m256 im, cf_t *y)
+{
+  simde_mm256_storeu_ps((float *)y, simde_mm256_unpacklo_ps(re, im));
+  simde_mm256_storeu_ps((float *)(y + 4), simde_mm256_unpackhi_ps(re, im));
+}
+
 /*!\fn cf_t cf_sqrt(cf_t x)
 \brief Principal (single-valued) square root of one complex float number
 
@@ -975,13 +997,8 @@ static inline void sqrt_cf_vector(const cf_t *x, cf_t *y, const uint32_t N)
 
   uint32_t i = 0;
   for (; i + 8 <= N; i += 8) {
-    // Separate 8 complex elements into a real and an imaginary vector. Both come out in a permuted
-    // element order, which does not matter for a componentwise operation, and the unpack at the end
-    // undoes the permutation.
-    const simde__m256 a = simde_mm256_loadu_ps((const float *)(x + i));
-    const simde__m256 b = simde_mm256_loadu_ps((const float *)(x + i + 4));
-    const simde__m256 re = simde_mm256_shuffle_ps(a, b, 0x88);
-    const simde__m256 im = simde_mm256_shuffle_ps(a, b, 0xDD);
+    simde__m256 re, im;
+    cf_deinterleave(x + i, &re, &im);
 
     const simde__m256 abs_re = simde_mm256_andnot_ps(sign, re);
     const simde__m256 abs_im = simde_mm256_andnot_ps(sign, im);
@@ -1011,12 +1028,155 @@ static inline void sqrt_cf_vector(const cf_t *x, cf_t *y, const uint32_t N)
     out_re = simde_mm256_blendv_ps(out_re, zero, is_zero);
     out_im = simde_mm256_blendv_ps(out_im, im, is_zero); // keeps a signed zero, as cf_sqrt() does
 
-    // interleave the result back, undoing the permutation of the loads
-    simde_mm256_storeu_ps((float *)(y + i), simde_mm256_unpacklo_ps(out_re, out_im));
-    simde_mm256_storeu_ps((float *)(y + i + 4), simde_mm256_unpackhi_ps(out_re, out_im));
+    cf_interleave(out_re, out_im, y + i);
   }
   for (; i < N; i++)
     y[i] = cf_sqrt(x[i]);
+}
+
+/*! \brief Product of two complex floats, \f$x y\f$ */
+static inline cf_t cf_mul(const cf_t x, const cf_t y)
+{
+  return (cf_t){x.r * y.r - x.i * y.i, x.r * y.i + x.i * y.r};
+}
+
+/*! \brief Product of the conjugate of the first complex float with the second one,
+\f$\overline{x} y\f$
+
+The first operand is the conjugated one, as in mult_cpx_conj_vector() for c16_t.
+*/
+static inline cf_t cf_mul_conj(const cf_t x, const cf_t y)
+{
+  return (cf_t){x.r * y.r + x.i * y.i, x.r * y.i - x.i * y.r};
+}
+
+/*!\fn cf_t cf_div(cf_t x, cf_t y)
+\brief Quotient of two complex floats, \f$x / y\f$
+
+Note that x * conj(y) is only the numerator of the quotient, the division by |y|^2 is still needed:
+\f$x / y = x \overline{y} / |y|^2\f$. Rather than that direct form, which overflows as soon as
+|y|^2 leaves the float range although the quotient itself is representable, this uses Smith's
+algorithm: dividing the smaller of |y.r|, |y.i| by the larger one first keeps every intermediate
+value in range.
+
+Dividing by zero is not supported, it returns NaN rather than the infinities of C99 division.
+
+@param x Numerator
+@param y Denominator, must not be 0
+@returns \f$x / y\f$
+*/
+static inline cf_t cf_div(const cf_t x, const cf_t y)
+{
+  if (fabsf(y.r) >= fabsf(y.i)) {
+    const float r = y.i / y.r; // |r| <= 1
+    const float den = y.r + y.i * r; // = |y|^2 / y.r
+    return (cf_t){(x.r + x.i * r) / den, (x.i - x.r * r) / den};
+  } else {
+    const float r = y.r / y.i; // |r| < 1
+    const float den = y.r * r + y.i; // = |y|^2 / y.i
+    return (cf_t){(x.r * r + x.i) / den, (x.i * r - x.r) / den};
+  }
+}
+
+/*!\fn void mult_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, uint32_t N)
+\brief Componentwise product of two complex float vectors
+
+@param x1 Vector input 1 in the format |Re0 Im0|,...,|Re(N-1) Im(N-1)|
+@param x2 Vector input 2, same format
+@param y Vector output, may be x1 or x2 for an in place computation, must not partially overlap them
+@param N Number of complex elements of x1 and x2
+
+The function implemented is : \f$y_i = x1_i x2_i\f$
+*/
+static inline void mult_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, const uint32_t N)
+{
+  uint32_t i = 0;
+  for (; i + 8 <= N; i += 8) {
+    simde__m256 ar, ai, br, bi;
+    cf_deinterleave(x1 + i, &ar, &ai);
+    cf_deinterleave(x2 + i, &br, &bi);
+
+    const simde__m256 re = simde_mm256_fmsub_ps(ar, br, simde_mm256_mul_ps(ai, bi));
+    const simde__m256 im = simde_mm256_fmadd_ps(ar, bi, simde_mm256_mul_ps(ai, br));
+
+    cf_interleave(re, im, y + i);
+  }
+  for (; i < N; i++)
+    y[i] = cf_mul(x1[i], x2[i]);
+}
+
+/*!\fn void mult_conj_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, uint32_t N)
+\brief Componentwise product of the conjugate of a complex float vector with a second one
+
+@param x1 Vector input 1, the conjugated one, in the format |Re0 Im0|,...,|Re(N-1) Im(N-1)|
+@param x2 Vector input 2, same format
+@param y Vector output, may be x1 or x2 for an in place computation, must not partially overlap them
+@param N Number of complex elements of x1 and x2
+
+The function implemented is : \f$y_i = \overline{x1_i} x2_i\f$
+*/
+static inline void mult_conj_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, const uint32_t N)
+{
+  uint32_t i = 0;
+  for (; i + 8 <= N; i += 8) {
+    simde__m256 ar, ai, br, bi;
+    cf_deinterleave(x1 + i, &ar, &ai);
+    cf_deinterleave(x2 + i, &br, &bi);
+
+    const simde__m256 re = simde_mm256_fmadd_ps(ar, br, simde_mm256_mul_ps(ai, bi));
+    const simde__m256 im = simde_mm256_fmsub_ps(ar, bi, simde_mm256_mul_ps(ai, br));
+
+    cf_interleave(re, im, y + i);
+  }
+  for (; i < N; i++)
+    y[i] = cf_mul_conj(x1[i], x2[i]);
+}
+
+/*!\fn void div_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, uint32_t N)
+\brief Componentwise quotient of two complex float vectors
+
+Same algorithm as cf_div(), see there for why the division is not done as x1 * conj(x2) / |x2|^2,
+and for the behaviour when x2 is 0.
+
+@param x1 Vector of numerators in the format |Re0 Im0|,...,|Re(N-1) Im(N-1)|
+@param x2 Vector of denominators, same format, elements must not be 0
+@param y Vector output, may be x1 or x2 for an in place computation, must not partially overlap them
+@param N Number of complex elements of x1 and x2
+
+The function implemented is : \f$y_i = x1_i / x2_i\f$
+*/
+static inline void div_cf_vector(const cf_t *x1, const cf_t *x2, cf_t *y, const uint32_t N)
+{
+  const simde__m256 sign = simde_mm256_set1_ps(-0.0f); // sign bit only, used to mask/flip signs
+
+  uint32_t i = 0;
+  for (; i + 8 <= N; i += 8) {
+    simde__m256 xr, xi, yr, yi;
+    cf_deinterleave(x1 + i, &xr, &xi);
+    cf_deinterleave(x2 + i, &yr, &yi);
+
+    // Smith's algorithm without a branch: where |y.i| > |y.r|, the real and the imaginary parts
+    // swap roles, which is what the two branches of cf_div() do. a is then always the larger of
+    // y.r, y.i in magnitude, so that the ratio r below is at most 1.
+    const simde__m256 swap = simde_mm256_cmp_ps(simde_mm256_andnot_ps(sign, yr),
+                                                simde_mm256_andnot_ps(sign, yi),
+                                                SIMDE_CMP_LT_OQ);
+    const simde__m256 a = simde_mm256_blendv_ps(yr, yi, swap);
+    const simde__m256 b = simde_mm256_blendv_ps(yi, yr, swap);
+    const simde__m256 p = simde_mm256_blendv_ps(xr, xi, swap);
+    const simde__m256 q = simde_mm256_blendv_ps(xi, xr, swap);
+
+    const simde__m256 r = simde_mm256_div_ps(b, a);
+    const simde__m256 den = simde_mm256_fmadd_ps(b, r, a); // = |y|^2 / a
+    const simde__m256 num_re = simde_mm256_fmadd_ps(q, r, p);
+    // the imaginary numerator is q - p * r on one side of the swap and its opposite on the other
+    const simde__m256 num_im = simde_mm256_xor_ps(simde_mm256_fnmadd_ps(p, r, q),
+                                                  simde_mm256_and_ps(sign, swap));
+
+    cf_interleave(simde_mm256_div_ps(num_re, den), simde_mm256_div_ps(num_im, den), y + i);
+  }
+  for (; i < N; i++)
+    y[i] = cf_div(x1[i], x2[i]);
 }
 
 /*!\fn int32_t signal_energy(int *,uint32_t);
