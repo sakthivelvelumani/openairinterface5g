@@ -1391,6 +1391,18 @@ static inline int compress_c16_inplace(c16_t *arr, uint32_t mask)
   return w;
 }
 
+static inline int compress_cf_inplace(cf_t *arr, uint32_t mask)
+{
+  int w = 0;
+  uint32_t m = mask;
+  while (m) {
+    int i = __builtin_ctz(m);
+    arr[w++] = arr[i];
+    m &= m - 1;
+  }
+  return w;
+}
+
 // Process one PRB
 static int process_symbol_subband_sse(const c16_t *rxdataF,
                                       const c16_t *chest,
@@ -1536,8 +1548,8 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
                                                     uint16_t valid_re_mask)
 {
   // channel level calc
-  const int16_t x = factor2(NR_NB_SC_PER_RB);
-  const int16_t y = NR_NB_SC_PER_RB >> x;
+  const int16_t x = factor2(2 * NR_NB_SC_PER_RB);
+  const int16_t y = (2 * NR_NB_SC_PER_RB) >> x;
   const int32_t avg = simde_mm_average((simde__m128i *)chest0, 2 * NR_NB_SC_PER_RB, x, y);
   int16_t *llr_start = llr;
 
@@ -1598,7 +1610,7 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
 
   // Cholesky decomposition
   //   G = L * L^H with L = l00   0
-  //                     l10  l11
+  //                        l10  l11
   // l0 holds l00, the two halves of l1 hold l10 and l11. Both diagonal elements are real.
   simde__m256 l0[NUM_AVX2_VECT];
   simde__m256 l1[2 * NUM_AVX2_VECT];
@@ -1663,8 +1675,8 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
     num_valid_re = NR_NB_SC_PER_RB;
   } else {
     // Group valid REs to start of buffer
-    num_valid_re = compress_c16_inplace((c16_t *)&x0, valid_re_mask);
-    num_valid_re = compress_c16_inplace((c16_t *)&x1, valid_re_mask);
+    num_valid_re = compress_cf_inplace((cf_t *)&x0, valid_re_mask);
+    compress_cf_inplace((cf_t *)&x1, valid_re_mask);
   }
 
   // Layer demapping
@@ -1673,9 +1685,10 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   interleave_complexfloat((cf_t *)&x0, (cf_t *)&x1, num_valid_re, x_demapped);
 
   // LLR generation
+  const uint num_valid_re_all_layers = 2 * num_valid_re;
   switch (mod_order) {
     case 2:
-      nr_qpsk_llr_float(x_demapped, num_valid_re, llr);
+      nr_qpsk_llr_float(x_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 4:
@@ -1690,6 +1703,7 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
     default:
       break;
   }
+  llr += (2 * num_valid_re * mod_order);
   return (int)(llr - llr_start);
 }
 
