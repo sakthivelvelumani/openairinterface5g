@@ -3,6 +3,7 @@
  */
 
 #include "PHY/defs_nr_common.h"
+#include "PHY/impl_defs_nr.h"
 #define _GNU_SOURCE // For pthread_setname_np
 #include <pthread.h>
 #include "executables/nr-ue-ru.h"
@@ -240,6 +241,28 @@ static void UE_synch(void *arg) {
     else
       LOG_E(PHY, "synch Failed: \n");
   }
+}
+
+static uint get_num_dl_symbols_mixed_slot(const fapi_nr_config_request_t *cfg, int slot)
+{
+  if (cfg->cell_config.frame_duplex_type == FDD)
+    return 0;
+
+  const fapi_nr_tdd_table_t *tdd_table = &cfg->tdd_table;
+  int rel_slot = slot % tdd_table->tdd_period_in_slots;
+
+  if (tdd_table->max_tdd_periodicity_list == NULL) // this happens before receiving TDD configuration
+    return NR_DOWNLINK_SLOT;
+
+  const fapi_nr_max_tdd_periodicity_t *current_slot = &tdd_table->max_tdd_periodicity_list[rel_slot];
+  uint num_dl_symb = 0;
+  for (int i = 0; i < NR_SYMBOLS_PER_SLOT; i++) {
+    if (current_slot->max_num_of_symbol_per_slot_list[i].slot_config != 0) {
+      break;
+    }
+    num_dl_symb++;
+  }
+  return num_dl_symb;
 }
 
 static int nr_ue_slot_select(const fapi_nr_config_request_t *cfg, int nr_slot)
@@ -1001,8 +1024,19 @@ void *UE_thread(void *arg)
     }
 
     // use previous timing_advance value to compute writeTimestamp
-    const openair0_timestamp_t writeTimestamp =
-        rx_timestamp + get_samples_slot_duration(fp, slot_nr, duration_rx_to_tx) - firstSymSamp - UE->N_TA_offset - timing_advance;
+    uint mixed_slot_offset = 0;
+    uint num_mixed_dl_symb = 0;
+    {
+      const int curr_slot_type = curMsg.proc.tx_slot_type;
+      const int slot = curMsg.proc.nr_slot_tx;
+      if (curr_slot_type == NR_MIXED_SLOT && !IS_SOFTMODEM_RFSIM) {
+        // Offset by the first UL symbol
+        num_mixed_dl_symb = get_num_dl_symbols_mixed_slot(cfg, slot);
+        mixed_slot_offset = get_samples_symbol_duration(fp, slot, 0, num_mixed_dl_symb);
+      }
+    }
+    const openair0_timestamp_t writeTimestamp = rx_timestamp + get_samples_slot_duration(fp, slot_nr, duration_rx_to_tx)
+                                                - firstSymSamp - UE->N_TA_offset - timing_advance + mixed_slot_offset;
 
     // Calculate TX deadline, approximately 1 symbol before the first sample should be written
     const uint64_t samples_diff = writeTimestamp - rx_timestamp - fp->ofdm_symbol_size;
@@ -1010,7 +1044,9 @@ void *UE_thread(void *arg)
     const uint64_t absolute_deadline_us = current_time.tv_sec * 1e6 + current_time.tv_nsec * 1e-3 + deadline_us;
 
     // but use current UE->timing_advance value to compute writeBlockSize
-    int writeBlockSize = get_samples_per_slot((slot_nr + duration_rx_to_tx) % nb_slot_frame, fp) - iq_shift_to_apply;
+    int writeBlockSize =
+        get_samples_symbol_duration(fp, curMsg.proc.nr_slot_tx, num_mixed_dl_symb, fp->symbols_per_slot - num_mixed_dl_symb)
+        - iq_shift_to_apply;
     int new_timing_advance = UE->timing_advance + UE->timing_advance_ntn;
     if (new_timing_advance != timing_advance) {
       writeBlockSize -= new_timing_advance - timing_advance;

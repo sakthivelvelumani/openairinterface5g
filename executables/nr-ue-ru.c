@@ -3,6 +3,7 @@
  */
 
 #include "nr-ue-ru.h"
+#include "common_lib.h"
 #include "nr-uesoftmodem.h"
 #include "PHY/NR_UE_TRANSPORT/nr_transport_proto_ue.h"
 #include "common/config/config_paramdesc.h"
@@ -329,6 +330,8 @@ void nrue_init_openair0(void)
     cfg->clock_source = nrue_rus[ru_id].clock_source;
     cfg->time_source = nrue_rus[ru_id].time_source;
     cfg->tune_offset = nrue_rus[ru_id].tune_offset;
+    // Set this to configure automatic GPIO control for TDD
+    cfg->gpio_controller = RU_GPIO_CONTROL_GENERIC;
   }
 }
 
