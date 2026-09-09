@@ -1875,17 +1875,25 @@ static int process_symbol_subband_sse_4_layer_4_ant(const c16_t *rxdataF,
   for (uint m = 0; m < nof_layers; m++)
     sum_conj_mult_ant(h[m], rxf, nof_ant, b[m]);
 
+  // MMSE regularization: the system solved below is (H^H * H + sigma^2 * I) x = H^H * y rather than
+  // the zero forcing (H^H * H) x = H^H * y. nvar is the noise variance in the same fixed point units
+  // as the samples, the same units simde_mm_average() returned avg in, so it is normalized like
+  // |h|^2, i.e. divided by cvt_divisor^2. Without this term a near singular Gram matrix amplifies
+  // the noise without bound, and g[j][j] - sum |l[j][k]|^2 can even turn negative and stall the
+  // decomposition on a zero diagonal.
+  const float nvar_norm = (float)nvar / (cvt_divisor * cvt_divisor);
+
   // G = H^H * H is Hermitian, so only its lower triangle is built:
   //   g[m][n] = sum over the antennas of conj(h[m][ant]) * h[n][ant], for n <= m
   cf_t g[MMSE_4X4_LAYERS][MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
   for (uint m = 0; m < nof_layers; m++) {
     for (uint n = 0; n <= m; n++)
       sum_conj_mult_ant(h[m], h[n], nof_ant, g[m][n]);
-    // the diagonal is a sum of |h|^2 and therefore real, but the FMA inside the conjugate product
+    // The diagonal is a sum of |h|^2 and therefore real, but the FMA inside the conjugate product
     // leaves the rounding error of h.r*h.i in the imaginary part; clearing it keeps the diagonal of
-    // G, and with it the diagonal of L, exactly real
+    // G, and with it the diagonal of L, exactly real. The regularization goes here as well.
     for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
-      g[m][m][i].i = 0.0f;
+      g[m][m][i] = (cf_t){g[m][m][i].r + nvar_norm, 0.0f};
   }
 
   // Cholesky decomposition, G = L * L^H with L lower triangular:
