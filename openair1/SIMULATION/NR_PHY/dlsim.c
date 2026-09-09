@@ -1065,6 +1065,11 @@ int main(int argc, char **argv)
   time_stats_t noise_stats = {0};
   time_stats_t pipeline_stats = {0};
 
+  extern FILE *nr_pdsch_symbol_dump;
+  extern FILE *nr_pdsch_llr_dump;
+  nr_pdsch_symbol_dump = fopen("comp_dump.bin", "wb");
+  nr_pdsch_llr_dump = fopen("llr_dump.bin", "wb");
+
   for (SNR = snr0; SNR < snr1 && !stop; SNR += .2) {
 
     varArray_t *table_tx=initVarArray(1000,sizeof(double));
@@ -1541,6 +1546,11 @@ int main(int argc, char **argv)
     }
 
   } // NSR
+
+  if (nr_pdsch_symbol_dump)
+    fclose(nr_pdsch_symbol_dump);
+  if (nr_pdsch_llr_dump)
+    fclose(nr_pdsch_llr_dump);
 
   free(Sched_INFO);
 

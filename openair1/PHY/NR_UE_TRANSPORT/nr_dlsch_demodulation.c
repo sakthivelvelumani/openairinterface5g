@@ -1537,6 +1537,9 @@ static inline void sum_conj_mult_2_ant(const simde__m256 *a0,
 }
 
 
+// symbol_dump is optional: when it is not NULL, the equalized symbols of this RB are appended to it
+// in binary, as 2 * num_valid_re cf_t, i.e. two consecutive complex floats per RE, layer 0 then
+// layer 1. Nothing is seeked, the caller decides where in the file the RB lands.
 static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
                                                     const c16_t *rxdataF1,
                                                     const c16_t *chest0,
@@ -1545,7 +1548,9 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
                                                     int16_t *llr,
                                                     uint32_t nvar,
                                                     uint8_t mod_order,
-                                                    uint16_t valid_re_mask)
+                                                    uint16_t valid_re_mask,
+                                                    FILE *symbol_dump,
+                                                    FILE *llr_dump)
 {
   // channel level calc
   const int16_t x = factor2(2 * NR_NB_SC_PER_RB);
@@ -1683,9 +1688,15 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   cf_t x_demapped[2 * NR_NB_SC_PER_RB];
   DevAssert(num_valid_re <= sizeofArray(x_demapped));
   interleave_complexfloat((cf_t *)&x0, (cf_t *)&x1, num_valid_re, x_demapped);
+  const uint num_valid_re_all_layers = 2 * num_valid_re;
+
+  if (symbol_dump) {
+    const size_t written = fwrite(x_demapped, sizeof(*x_demapped), num_valid_re_all_layers, symbol_dump);
+    if (written != num_valid_re_all_layers)
+      LOG_E(PHY, "wrote only %zu of %u equalized symbols to the dump file\n", written, num_valid_re_all_layers);
+  }
 
   // LLR generation
-  const uint num_valid_re_all_layers = 2 * num_valid_re;
   switch (mod_order) {
     case 2:
       nr_qpsk_llr_float(x_demapped, num_valid_re_all_layers, llr);
@@ -1703,7 +1714,13 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
     default:
       break;
   }
-  llr += (2 * num_valid_re * mod_order);
+
+  if (llr_dump) {
+    const size_t written = fwrite(llr, sizeof(*llr), num_valid_re_all_layers * mod_order, llr_dump);
+    if (written != num_valid_re_all_layers * mod_order)
+      LOG_E(PHY, "wrote only %zu of %u llr to the dump file\n", written, num_valid_re_all_layers * mod_order);
+  }
+  llr += (num_valid_re_all_layers * mod_order);
   return (int)(llr - llr_start);
 }
 
@@ -1749,6 +1766,13 @@ static inline uint16_t get_combined_valid_re_bitmap(int rb_idx,
   else
     return (~csi_re_bitmap & ptrs_dmrs);
 }
+
+#define PDSCH_DUMP_FILE
+
+#ifdef PDSCH_DUMP_FILE
+FILE *nr_pdsch_symbol_dump = NULL;
+FILE *nr_pdsch_llr_dump = NULL;
+#endif
 
 int pdsch_process_symbol(const c16_t *rxdataF,
                          const c16_t *chest,
@@ -1809,7 +1833,10 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                                                            llr,
                                                            nvar,
                                                            mod_order,
-                                                           valid_re_mask);
+                                                           valid_re_mask,
+                                                           nr_pdsch_symbol_dump,
+                                                           nr_pdsch_llr_dump);
+
       llr += num_llr;
     }
   }
