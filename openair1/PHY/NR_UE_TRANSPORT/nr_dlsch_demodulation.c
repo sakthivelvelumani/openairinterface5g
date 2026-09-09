@@ -1665,12 +1665,18 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   sum_conj_mult_2_ant(chest_ps1, chest_ps1, chest_ps1 + NUM_AVX2_VECT, chest_ps1 + NUM_AVX2_VECT, gram1 + NUM_AVX2_VECT);
   const simde__m256 conj_mask = simde_mm256_castsi256_ps(simde_mm256_set_epi32(-1, 0, -1, 0, -1, 0, -1, 0));
   const simde__m256 signflip = simde_mm256_and_ps(conj_mask, simde_mm256_set1_ps(-0.0f));
+  // MMSE regularization: the system solved below is (H^H * H + sigma^2 * I) x = H^H * y rather than
+  // the zero forcing (H^H * H) x = H^H * y. nvar is the noise variance in the same fixed point units
+  // as the samples, the same units simde_mm_average() returned avg in, so it is normalized like
+  // |h|^2, i.e. divided by cvt_divisor^2. Only the real lanes carry it, the imaginary ones stay 0.
+  const simde__m256 nvar_norm =
+      simde_mm256_andnot_ps(conj_mask, simde_mm256_set1_ps((float)nvar / (cvt_divisor * cvt_divisor)));
   for (uint i = 0; i < NUM_AVX2_VECT; i++) {
     gram1[i] = simde_mm256_xor_ps(gram0[i + NUM_AVX2_VECT], signflip); // g10 = conj(g01)
     // |h|^2 is real, but the FMA inside the conjugate product leaves the rounding error of h.r*h.i
     // in the imaginary part; clearing it keeps the diagonal of G, and with it that of L, real
-    gram0[i] = simde_mm256_andnot_ps(conj_mask, gram0[i]);
-    gram1[i + NUM_AVX2_VECT] = simde_mm256_andnot_ps(conj_mask, gram1[i + NUM_AVX2_VECT]);
+    gram0[i] = simde_mm256_add_ps(simde_mm256_andnot_ps(conj_mask, gram0[i]), nvar_norm);
+    gram1[i + NUM_AVX2_VECT] = simde_mm256_add_ps(simde_mm256_andnot_ps(conj_mask, gram1[i + NUM_AVX2_VECT]), nvar_norm);
   }
 
   // Cholesky decomposition
