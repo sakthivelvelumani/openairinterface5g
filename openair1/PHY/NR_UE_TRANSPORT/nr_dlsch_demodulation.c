@@ -1521,6 +1521,20 @@ static inline void nr_qpsk_llr_float(const cf_t *in, const uint len, int16_t *ou
   }
 }
 
+static inline void nr_16qam_llr_float(const cf_t *in, const uint len, int16_t *out)
+{
+  for (uint i = 0; i < len; i++) {
+    out[i * 4] = in[i].r * 16;
+    out[i * 4 + 1] = in[i].i * 16;
+    // The magnitude bits say whether |y| sits below or above the 2 / sqrt(10) threshold, so the
+    // comparison is against the absolute value, as protected_abs256() does in nr_16qam_llr().
+    // Without it, 0.6324 - y is positive for every negative y, which pins the bit to 0 over half
+    // of the constellation.
+    out[i * 4 + 2] = (0.6324f - fabsf(in[i].r)) * 16;
+    out[i * 4 + 3] = (0.6324f - fabsf(in[i].i)) * 16;
+  }
+}
+
 // y = conj(a0) * b0 + conj(a1) * b1, componentwise over the 12 REs of one RB. This is the shape of
 // every term of H^H * y and of H^H * H for 2 receive antennas. y must not alias any of the inputs.
 static inline void sum_conj_mult_2_ant(const simde__m256 *a0,
@@ -1703,6 +1717,7 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
       break;
 
     case 4:
+      nr_16qam_llr_float(x_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 6:
