@@ -1505,6 +1505,47 @@ static inline void interleave_complexfloat256(simde__m256 a, simde__m256 b, simd
   *hi = simde_mm256_castpd_ps(simde_mm256_permute2f128_pd(lo_lanes, hi_lanes, 0x31)); // a2 b2 a3 b3
 }
 
+// The LLRs of the float MMSE paths are scaled by the post equalization SINR of their layer, so
+// that their magnitude carries the reliability of the RE, the way the un-normalized MRC output does
+// it implicitly in the fixed point path. MMSE_LLR_SCALE leaves a SINR of 1 at the amplitude the
+// unweighted code produced, and the SINR is clamped so that a weighted LLR cannot leave the int16
+// range: MMSE_MAX_SINR * MMSE_LLR_SCALE * 1.0 still fits.
+#define MMSE_LLR_SCALE 16.0f
+#define MMSE_MAX_SINR 1024.0f
+// Floor of the MMSE gain, only reached when a layer sees no channel at all
+#define MMSE_MIN_GAIN 1e-3f
+
+static inline int16_t sat_int16(const float v)
+{
+  return (int16_t)fminf(fmaxf(v, (float)INT16_MIN), (float)INT16_MAX);
+}
+
+// Removes the bias of the MMSE estimate of one RE of one layer, and returns the weight its LLRs
+// need. With A = G + sigma^2 * I and v = [A^-1]_mm:
+//   mu   = 1 - sigma^2 * v   the gain the estimate carries, below 1, since A^-1 * G = I - sigma^2 * A^-1
+//   sinr = mu / (1 - mu)     the post equalization SINR of the unbiased estimate
+// mu is floored so that the division stays finite where a layer sees no channel; the weight goes to
+// zero there anyway, so such REs contribute nothing to the decoder.
+static inline float unbias_mmse_re(const float inv_diag, const float nvar_norm, cf_t *x)
+{
+  const float mu = fmaxf(1.0f - nvar_norm * inv_diag, MMSE_MIN_GAIN);
+  *x = (cf_t){x->r / mu, x->i / mu};
+  return fminf(mu / (1.0f - mu), MMSE_MAX_SINR);
+}
+
+// Same as compress_cf_inplace() for the per RE LLR weights, which have to follow their symbols
+static inline int compress_float_inplace(float *arr, uint32_t mask)
+{
+  int w = 0;
+  uint32_t m = mask;
+  while (m) {
+    int i = __builtin_ctz(m);
+    arr[w++] = arr[i];
+    m &= m - 1;
+  }
+  return w;
+}
+
 static inline void interleave_complexfloat(const cf_t *a, const cf_t *b, const uint len, cf_t *out)
 {
   for (uint i = 0; i < len; i++) {
@@ -1513,25 +1554,27 @@ static inline void interleave_complexfloat(const cf_t *a, const cf_t *b, const u
   }
 }
 
-static inline void nr_qpsk_llr_float(const cf_t *in, const uint len, int16_t *out)
+static inline void nr_qpsk_llr_float(const cf_t *in, const float *weight, const uint len, int16_t *out)
 {
   for (uint i = 0; i < len; i++) {
-    out[i * 2] = in[i].r * 16;
-    out[i * 2 + 1] = in[i].i * 16;
+    const float w = weight[i] * MMSE_LLR_SCALE;
+    out[i * 2] = sat_int16(w * in[i].r);
+    out[i * 2 + 1] = sat_int16(w * in[i].i);
   }
 }
 
-static inline void nr_16qam_llr_float(const cf_t *in, const uint len, int16_t *out)
+static inline void nr_16qam_llr_float(const cf_t *in, const float *weight, const uint len, int16_t *out)
 {
   for (uint i = 0; i < len; i++) {
-    out[i * 4] = in[i].r * 16;
-    out[i * 4 + 1] = in[i].i * 16;
+    const float w = weight[i] * MMSE_LLR_SCALE;
+    out[i * 4] = sat_int16(w * in[i].r);
+    out[i * 4 + 1] = sat_int16(w * in[i].i);
     // The magnitude bits say whether |y| sits below or above the 2 / sqrt(10) threshold, so the
     // comparison is against the absolute value, as protected_abs256() does in nr_16qam_llr().
     // Without it, 0.6324 - y is positive for every negative y, which pins the bit to 0 over half
-    // of the constellation.
-    out[i * 4 + 2] = (0.6324f - fabsf(in[i].r)) * 16;
-    out[i * 4 + 3] = (0.6324f - fabsf(in[i].i)) * 16;
+    // of the constellation. The threshold only holds for the unbiased estimate.
+    out[i * 4 + 2] = sat_int16(w * (0.6324f - fabsf(in[i].r)));
+    out[i * 4 + 3] = sat_int16(w * (0.6324f - fabsf(in[i].i)));
   }
 }
 
@@ -1585,6 +1628,14 @@ static inline void submult_conj_cf_rb(const cf_t *a, const cf_t *b, cf_t *y)
   mult_conj_cf_vector(a, b, t, NR_NB_SC_PER_RB);
   for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
     y[i] = (cf_t){y[i].r - t[i].r, y[i].i - t[i].i};
+}
+
+// Layer demapping of the per RE LLR weights, so that they stay aligned with their symbols
+static inline void layer_demap_float(const float w[][NR_NB_SC_PER_RB], const uint nof_layers, const uint len, float *out)
+{
+  for (uint re = 0; re < len; re++)
+    for (uint layer = 0; layer < nof_layers; layer++)
+      out[re * nof_layers + layer] = w[layer][re];
 }
 
 // out[re * nof_layers + layer] = x[layer][re], i.e. the layer demapping of 38.211 7.3.1.5, for any
@@ -1669,8 +1720,8 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   // the zero forcing (H^H * H) x = H^H * y. nvar is the noise variance in the same fixed point units
   // as the samples, the same units simde_mm_average() returned avg in, so it is normalized like
   // |h|^2, i.e. divided by cvt_divisor^2. Only the real lanes carry it, the imaginary ones stay 0.
-  const simde__m256 nvar_norm =
-      simde_mm256_andnot_ps(conj_mask, simde_mm256_set1_ps((float)nvar / (cvt_divisor * cvt_divisor)));
+  const float nvar_norm_f = (float)nvar / (cvt_divisor * cvt_divisor);
+  const simde__m256 nvar_norm = simde_mm256_andnot_ps(conj_mask, simde_mm256_set1_ps(nvar_norm_f));
   for (uint i = 0; i < NUM_AVX2_VECT; i++) {
     gram1[i] = simde_mm256_xor_ps(gram0[i + NUM_AVX2_VECT], signflip); // g10 = conj(g01)
     // |h|^2 is real, but the FMA inside the conjugate product leaves the rounding error of h.r*h.i
@@ -1723,6 +1774,8 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   // so that a residual imaginary part on the diagonal cannot leak into the result.
   simde__m256 x0[NUM_AVX2_VECT];
   simde__m256 x1[NUM_AVX2_VECT];
+  float weight0[NR_NB_SC_PER_RB];
+  float weight1[NR_NB_SC_PER_RB];
   {
     // x1 = z1 / conj(l11)
     simde__m256 diag[NUM_AVX2_VECT];
@@ -1740,20 +1793,46 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
     div_cf_vector((const cf_t *)d, (const cf_t *)diag, (cf_t *)x0, NR_NB_SC_PER_RB);
   }
 
+  // Unbiasing and LLR weights, both from the diagonal of A^-1, with A = G + sigma^2 * I the matrix
+  // that was decomposed. For a 2x2 that diagonal is closed form: [A^-1]_00 = a11 / det and
+  // [A^-1]_11 = a00 / det, with det = (l00 * l11)^2 because the diagonal of L is real. a00 and a11
+  // are the regularized Gram diagonal, still in gram0 and gram1.
+  {
+    const cf_t *a00 = (const cf_t *)gram0;
+    const cf_t *a11 = (const cf_t *)(gram1 + NUM_AVX2_VECT);
+    const cf_t *l00 = (const cf_t *)l0;
+    const cf_t *l11 = (const cf_t *)(l1 + NUM_AVX2_VECT);
+    cf_t *xl0 = (cf_t *)x0;
+    cf_t *xl1 = (cf_t *)x1;
+    for (uint re = 0; re < NR_NB_SC_PER_RB; re++) {
+      const float sqrt_det = l00[re].r * l11[re].r;
+      const float inv_det = 1.0f / (sqrt_det * sqrt_det);
+      weight0[re] = unbias_mmse_re(a11[re].r * inv_det, nvar_norm_f, &xl0[re]);
+      weight1[re] = unbias_mmse_re(a00[re].r * inv_det, nvar_norm_f, &xl1[re]);
+    }
+  }
+
   // Group valid REs: extraction
   uint num_valid_re = 0;
   if (valid_re_mask == 0xfff) {
     num_valid_re = NR_NB_SC_PER_RB;
   } else {
-    // Group valid REs to start of buffer
+    // Group valid REs to start of buffer, symbols and their weights alike
     num_valid_re = compress_cf_inplace((cf_t *)&x0, valid_re_mask);
     compress_cf_inplace((cf_t *)&x1, valid_re_mask);
+    compress_float_inplace(weight0, valid_re_mask);
+    compress_float_inplace(weight1, valid_re_mask);
   }
 
   // Layer demapping
   cf_t x_demapped[2 * NR_NB_SC_PER_RB];
-  DevAssert(num_valid_re <= sizeofArray(x_demapped));
+  float w_demapped[2 * NR_NB_SC_PER_RB];
+  DevAssert(2 * num_valid_re <= sizeofArray(x_demapped));
   interleave_complexfloat((cf_t *)&x0, (cf_t *)&x1, num_valid_re, x_demapped);
+  for (uint re = 0; re < num_valid_re; re++) {
+    w_demapped[re * 2] = weight0[re];
+    w_demapped[re * 2 + 1] = weight1[re];
+  }
   const uint num_valid_re_all_layers = 2 * num_valid_re;
 
   if (symbol_dump) {
@@ -1765,11 +1844,11 @@ static int process_symbol_subband_sse_2_layer_2_ant(const c16_t *rxdataF0,
   // LLR generation
   switch (mod_order) {
     case 2:
-      nr_qpsk_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      nr_qpsk_llr_float(x_demapped, w_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 4:
-      nr_16qam_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      nr_16qam_llr_float(x_demapped, w_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 6:
@@ -1948,17 +2027,49 @@ static int process_symbol_subband_sse_4_layer_4_ant(const c16_t *rxdataF,
     div_cf_vector(t, l[i][i], xeq[i], NR_NB_SC_PER_RB);
   }
 
-  // Group valid REs: extraction
+  // Diagonal of A^-1, with A = G + sigma^2 * I the matrix that was decomposed. It is what both the
+  // unbiasing and the LLR weight need, and it comes out of the factor already computed:
+  //   A^-1 = L^-H * L^-1, so [A^-1]_mm = sum over k >= m of |[L^-1]_km|^2
+  // Column m of L^-1 is the forward substitution of the unit vector e_m through L, which is the
+  // same recursion as the forward substitution above with a different right hand side.
+  float inv_diag[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint m = 0; m < nof_layers; m++) {
+    cf_t col[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+    for (uint re = 0; re < NR_NB_SC_PER_RB; re++)
+      inv_diag[m][re] = 0.0f;
+    for (uint i = m; i < nof_layers; i++) {
+      cf_t t[NR_NB_SC_PER_RB];
+      for (uint re = 0; re < NR_NB_SC_PER_RB; re++)
+        t[re] = (cf_t){i == m ? 1.0f : 0.0f, 0.0f};
+      for (uint k = m; k < i; k++)
+        submult_cf_rb(l[i][k], col[k], t);
+      div_cf_vector(t, l[i][i], col[i], NR_NB_SC_PER_RB);
+      for (uint re = 0; re < NR_NB_SC_PER_RB; re++)
+        inv_diag[m][re] += col[i][re].r * col[i][re].r + col[i][re].i * col[i][re].i;
+    }
+  }
+
+  // Unbiasing and LLR weights
+  float weight[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint m = 0; m < nof_layers; m++)
+    for (uint re = 0; re < NR_NB_SC_PER_RB; re++)
+      weight[m][re] = unbias_mmse_re(inv_diag[m][re], nvar_norm, &xeq[m][re]);
+
+  // Group valid REs: extraction, symbols and their weights alike
   uint num_valid_re = NR_NB_SC_PER_RB;
   if (valid_re_mask != 0xfff)
-    for (uint m = 0; m < nof_layers; m++)
+    for (uint m = 0; m < nof_layers; m++) {
       num_valid_re = compress_cf_inplace(xeq[m], valid_re_mask);
+      compress_float_inplace(weight[m], valid_re_mask);
+    }
 
   // Layer demapping
   cf_t x_demapped[MMSE_4X4_LAYERS * NR_NB_SC_PER_RB];
+  float w_demapped[MMSE_4X4_LAYERS * NR_NB_SC_PER_RB];
   const uint num_valid_re_all_layers = nof_layers * num_valid_re;
   DevAssert(num_valid_re_all_layers <= sizeofArray(x_demapped));
   layer_demap_cf(xeq, nof_layers, num_valid_re, x_demapped);
+  layer_demap_float(weight, nof_layers, num_valid_re, w_demapped);
 
   if (symbol_dump) {
     const size_t written = fwrite(x_demapped, sizeof(*x_demapped), num_valid_re_all_layers, symbol_dump);
@@ -1969,11 +2080,11 @@ static int process_symbol_subband_sse_4_layer_4_ant(const c16_t *rxdataF,
   // LLR generation
   switch (mod_order) {
     case 2:
-      nr_qpsk_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      nr_qpsk_llr_float(x_demapped, w_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 4:
-      nr_16qam_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      nr_16qam_llr_float(x_demapped, w_demapped, num_valid_re_all_layers, llr);
       break;
 
     case 6:
