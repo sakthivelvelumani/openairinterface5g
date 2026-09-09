@@ -1550,6 +1550,52 @@ static inline void sum_conj_mult_2_ant(const simde__m256 *a0,
     y[i] = simde_mm256_add_ps(y[i], t[i]);
 }
 
+// Dimensions of the 4 layer, 4 receive antenna solver further down
+#define MMSE_4X4_LAYERS 4
+#define MMSE_4X4_ANTENNAS 4
+
+// y = sum over the nof_ant receive antennas of conj(a_ant) * b_ant, over the 12 REs of one RB. a and
+// b hold one RB per antenna, contiguously. This is the shape of every term of H^H * y and of
+// H^H * H, and the generalization of sum_conj_mult_2_ant(). y must not alias the inputs.
+static inline void sum_conj_mult_ant(const cf_t *a, const cf_t *b, const uint nof_ant, cf_t *y)
+{
+  mult_conj_cf_vector(a, b, y, NR_NB_SC_PER_RB);
+  for (uint ant = 1; ant < nof_ant; ant++) {
+    const uint off = ant * NR_NB_SC_PER_RB;
+    cf_t t[NR_NB_SC_PER_RB];
+    mult_conj_cf_vector(a + off, b + off, t, NR_NB_SC_PER_RB);
+    for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
+      y[i] = (cf_t){y[i].r + t[i].r, y[i].i + t[i].i};
+  }
+}
+
+// y -= a * b over the 12 REs of one RB, the update of a substitution step
+static inline void submult_cf_rb(const cf_t *a, const cf_t *b, cf_t *y)
+{
+  cf_t t[NR_NB_SC_PER_RB];
+  mult_cf_vector(a, b, t, NR_NB_SC_PER_RB);
+  for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
+    y[i] = (cf_t){y[i].r - t[i].r, y[i].i - t[i].i};
+}
+
+// y -= conj(a) * b over the 12 REs of one RB. With a == b this subtracts |a|^2.
+static inline void submult_conj_cf_rb(const cf_t *a, const cf_t *b, cf_t *y)
+{
+  cf_t t[NR_NB_SC_PER_RB];
+  mult_conj_cf_vector(a, b, t, NR_NB_SC_PER_RB);
+  for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
+    y[i] = (cf_t){y[i].r - t[i].r, y[i].i - t[i].i};
+}
+
+// out[re * nof_layers + layer] = x[layer][re], i.e. the layer demapping of 38.211 7.3.1.5, for any
+// number of layers. interleave_complexfloat() is the 2 layer case of this.
+static inline void layer_demap_cf(const cf_t x[][NR_NB_SC_PER_RB], const uint nof_layers, const uint len, cf_t *out)
+{
+  for (uint re = 0; re < len; re++)
+    for (uint layer = 0; layer < nof_layers; layer++)
+      out[re * nof_layers + layer] = x[layer][re];
+}
+
 
 // symbol_dump is optional: when it is not NULL, the equalized symbols of this RB are appended to it
 // in binary, as 2 * num_valid_re cf_t, i.e. two consecutive complex floats per RE, layer 0 then
@@ -1782,6 +1828,159 @@ static inline uint16_t get_combined_valid_re_bitmap(int rb_idx,
     return (~csi_re_bitmap & ptrs_dmrs);
 }
 
+// Same as process_symbol_subband_sse_2_layer_2_ant() for 4 layers and 4 receive antennas. The Gram
+// matrix and its Cholesky factor are 4x4 here, with 10 distinct entries each, so rather than
+// unrolling them the lower triangles are kept as [row][column] arrays of one RB and the textbook
+// loops run over them. Every innermost operation is still a single cf_t kernel call covering the 12
+// REs of the RB at once, so the arithmetic per RE is the same as in the 2 layer version.
+//
+// Unlike the 2 layer version, the inputs are passed as one pointer each, since the caller has them
+// contiguous anyway:
+//   rxdataF  one RB per receive antenna, antenna stride NR_NB_SC_PER_RB
+//   chest    one RB per (layer, antenna) pair, layer stride MMSE_4X4_ANTENNAS * NR_NB_SC_PER_RB and
+//            antenna stride NR_NB_SC_PER_RB, i.e. chest[layer][antenna] is the channel of that
+//            layer as seen by that antenna
+//
+// symbol_dump and llr_dump behave as in the 2 layer version, with 4 samples per RE instead of 2.
+static int process_symbol_subband_sse_4_layer_4_ant(const c16_t *rxdataF,
+                                                    const c16_t *chest,
+                                                    c16_t cpe,
+                                                    int16_t *llr,
+                                                    uint32_t nvar,
+                                                    uint8_t mod_order,
+                                                    uint16_t valid_re_mask,
+                                                    FILE *symbol_dump,
+                                                    FILE *llr_dump)
+{
+  const uint nof_layers = MMSE_4X4_LAYERS;
+  const uint nof_ant = MMSE_4X4_ANTENNAS;
+  int16_t *llr_start = llr;
+  AssertFatal(4 * NUM_AVX2_VECT == NR_NB_SC_PER_RB, "a RB does not fit in NUM_AVX2_VECT vectors");
+
+  // channel level calc, over the antennas of layer 0 as in the 2 layer version
+  const int16_t x = factor2(nof_ant * NR_NB_SC_PER_RB);
+  const int16_t y = (nof_ant * NR_NB_SC_PER_RB) >> x;
+  const int32_t avg = simde_mm_average((simde__m128i *)chest, nof_ant * NR_NB_SC_PER_RB, x, y);
+
+  // Convert c16_t to cf_t. The solve is invariant to a common scaling of H and y, so this only
+  // serves to keep the Gram matrix and its Cholesky factor in a comfortable float range.
+  const float cvt_divisor = sqrt((double)avg / 2);
+  cf_t h[MMSE_4X4_LAYERS][MMSE_4X4_ANTENNAS * NR_NB_SC_PER_RB];
+  cf_t rxf[MMSE_4X4_ANTENNAS * NR_NB_SC_PER_RB];
+  c16_to_cf_vector(chest, (cf_t *)h, nof_layers * nof_ant * NR_NB_SC_PER_RB, cvt_divisor);
+  c16_to_cf_vector(rxdataF, rxf, nof_ant * NR_NB_SC_PER_RB, cvt_divisor);
+
+  // b = H^H * y, i.e. b[m] = sum over the antennas of conj(h[m][ant]) * y[ant]
+  cf_t b[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint m = 0; m < nof_layers; m++)
+    sum_conj_mult_ant(h[m], rxf, nof_ant, b[m]);
+
+  // G = H^H * H is Hermitian, so only its lower triangle is built:
+  //   g[m][n] = sum over the antennas of conj(h[m][ant]) * h[n][ant], for n <= m
+  cf_t g[MMSE_4X4_LAYERS][MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint m = 0; m < nof_layers; m++) {
+    for (uint n = 0; n <= m; n++)
+      sum_conj_mult_ant(h[m], h[n], nof_ant, g[m][n]);
+    // the diagonal is a sum of |h|^2 and therefore real, but the FMA inside the conjugate product
+    // leaves the rounding error of h.r*h.i in the imaginary part; clearing it keeps the diagonal of
+    // G, and with it the diagonal of L, exactly real
+    for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
+      g[m][m][i].i = 0.0f;
+  }
+
+  // Cholesky decomposition, G = L * L^H with L lower triangular:
+  //   l[j][j] = sqrt(g[j][j] - sum over k < j of |l[j][k]|^2)
+  //   l[i][j] = (g[i][j] - sum over k < j of l[i][k] * conj(l[j][k])) / l[j][j]   for i > j
+  cf_t l[MMSE_4X4_LAYERS][MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint j = 0; j < nof_layers; j++) {
+    cf_t d[NR_NB_SC_PER_RB];
+    memcpy(d, g[j][j], sizeof(d));
+    for (uint k = 0; k < j; k++)
+      submult_conj_cf_rb(l[j][k], l[j][k], d); // conj(l) * l is |l|^2
+    sqrt_cf_vector(d, l[j][j], NR_NB_SC_PER_RB);
+    // the diagonal of a Cholesky factor is real, so conj() on it further down is a no-op
+    for (uint i = 0; i < NR_NB_SC_PER_RB; i++)
+      l[j][j][i].i = 0.0f;
+
+    for (uint i = j + 1; i < nof_layers; i++) {
+      cf_t t[NR_NB_SC_PER_RB];
+      memcpy(t, g[i][j], sizeof(t));
+      for (uint k = 0; k < j; k++)
+        submult_conj_cf_rb(l[j][k], l[i][k], t); // conj(l[j][k]) * l[i][k]
+      div_cf_vector(t, l[j][j], l[i][j], NR_NB_SC_PER_RB);
+    }
+  }
+
+  // Forward substitution, L * z = H^H * y:
+  //   z[i] = (b[i] - sum over k < i of l[i][k] * z[k]) / l[i][i]
+  cf_t z[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (uint i = 0; i < nof_layers; i++) {
+    cf_t t[NR_NB_SC_PER_RB];
+    memcpy(t, b[i], sizeof(t));
+    for (uint k = 0; k < i; k++)
+      submult_cf_rb(l[i][k], z[k], t);
+    div_cf_vector(t, l[i][i], z[i], NR_NB_SC_PER_RB);
+  }
+
+  // Backward substitution, L^H * x = z:
+  //   x[i] = (z[i] - sum over k > i of conj(l[k][i]) * x[k]) / conj(l[i][i])
+  // The diagonal was made exactly real above, so it is divided by as is.
+  cf_t xeq[MMSE_4X4_LAYERS][NR_NB_SC_PER_RB];
+  for (int i = (int)nof_layers - 1; i >= 0; i--) {
+    cf_t t[NR_NB_SC_PER_RB];
+    memcpy(t, z[i], sizeof(t));
+    for (uint k = i + 1; k < nof_layers; k++)
+      submult_conj_cf_rb(l[k][i], xeq[k], t);
+    div_cf_vector(t, l[i][i], xeq[i], NR_NB_SC_PER_RB);
+  }
+
+  // Group valid REs: extraction
+  uint num_valid_re = NR_NB_SC_PER_RB;
+  if (valid_re_mask != 0xfff)
+    for (uint m = 0; m < nof_layers; m++)
+      num_valid_re = compress_cf_inplace(xeq[m], valid_re_mask);
+
+  // Layer demapping
+  cf_t x_demapped[MMSE_4X4_LAYERS * NR_NB_SC_PER_RB];
+  const uint num_valid_re_all_layers = nof_layers * num_valid_re;
+  DevAssert(num_valid_re_all_layers <= sizeofArray(x_demapped));
+  layer_demap_cf(xeq, nof_layers, num_valid_re, x_demapped);
+
+  if (symbol_dump) {
+    const size_t written = fwrite(x_demapped, sizeof(*x_demapped), num_valid_re_all_layers, symbol_dump);
+    if (written != num_valid_re_all_layers)
+      LOG_E(PHY, "wrote only %zu of %u equalized symbols to the dump file\n", written, num_valid_re_all_layers);
+  }
+
+  // LLR generation
+  switch (mod_order) {
+    case 2:
+      nr_qpsk_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      break;
+
+    case 4:
+      nr_16qam_llr_float(x_demapped, num_valid_re_all_layers, llr);
+      break;
+
+    case 6:
+      break;
+
+    case 8:
+      break;
+
+    default:
+      break;
+  }
+
+  if (llr_dump) {
+    const size_t written = fwrite(llr, sizeof(*llr), num_valid_re_all_layers * mod_order, llr_dump);
+    if (written != num_valid_re_all_layers * mod_order)
+      LOG_E(PHY, "wrote only %zu of %u llr to the dump file\n", written, num_valid_re_all_layers * mod_order);
+  }
+  llr += (num_valid_re_all_layers * mod_order);
+  return (int)(llr - llr_start);
+}
+
 #define PDSCH_DUMP_FILE
 
 #ifdef PDSCH_DUMP_FILE
@@ -1844,6 +2043,16 @@ int pdsch_process_symbol(const c16_t *rxdataF,
                                                            rxdataF + rx_offset + NR_NB_SC_PER_RB,
                                                            chest + ch_offset,
                                                            chest + ch_offset + nb_rx * NR_NB_SC_PER_RB,
+                                                           cpe,
+                                                           llr,
+                                                           nvar,
+                                                           mod_order,
+                                                           valid_re_mask,
+                                                           nr_pdsch_symbol_dump,
+                                                           nr_pdsch_llr_dump);
+      else if (nb_layer == 4 && nb_rx == 4)
+        num_llr = process_symbol_subband_sse_4_layer_4_ant(rxdataF + rx_offset,
+                                                           chest + ch_offset,
                                                            cpe,
                                                            llr,
                                                            nvar,
