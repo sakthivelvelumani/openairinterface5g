@@ -2106,11 +2106,262 @@ static int process_symbol_subband_sse_4_layer_4_ant(const c16_t *rxdataF,
   return (int)(llr - llr_start);
 }
 
+// ------------------------------------------------------------------------------------------------
+// Stage wise variant of the 2 layer 2 antenna solver
+//
+// process_symbol_subband_sse_2_layer_2_ant() walks one RB through every stage of the receiver before
+// moving on to the next RB: the working set stays in L1, but every cf_t kernel call gets 12
+// elements, i.e. one 8 element SIMD block and a 4 element scalar tail, so a third of the REs are
+// handled one at a time. The variant below turns the loops inside out. Each stage runs over all the
+// REs of the symbol before the next one starts, so the kernels see thousands of elements and the
+// tails amortize away, at the cost of a working set of a few hundred kilobytes that no longer fits
+// in L1. Which of the two wins is what this exists to measure.
+// ------------------------------------------------------------------------------------------------
+
+#define MMSE_STAGE_LAYERS 2
+#define MMSE_STAGE_ANTENNAS 2
+
+// y += t, y = a - b, componentwise over n complex elements. Plain loops: the compiler vectorizes
+// them, and a dedicated kernel would only save a pass over memory that the adds share with the
+// multiplication that produced their input anyway.
+static inline void add_cf_vector(cf_t *y, const cf_t *t, const uint n)
+{
+  for (uint i = 0; i < n; i++)
+    y[i] = (cf_t){y[i].r + t[i].r, y[i].i + t[i].i};
+}
+
+static inline void sub_cf_vector(const cf_t *a, const cf_t *b, cf_t *y, const uint n)
+{
+  for (uint i = 0; i < n; i++)
+    y[i] = (cf_t){a[i].r - b[i].r, a[i].i - b[i].i};
+}
+
+// One array per intermediate of the pipeline, for a whole symbol
+typedef struct {
+  uint capacity_re;
+  void *block;
+  cf_t *h[MMSE_STAGE_LAYERS][MMSE_STAGE_ANTENNAS];
+  cf_t *rxf[MMSE_STAGE_ANTENNAS];
+  cf_t *b[MMSE_STAGE_LAYERS];
+  cf_t *g00, *g10, *g11;
+  cf_t *l00, *l10, *l11;
+  cf_t *z[MMSE_STAGE_LAYERS];
+  cf_t *x[MMSE_STAGE_LAYERS];
+  cf_t *tmp;
+  cf_t *demapped; // 2 per RE, the layers interleaved
+  float *nvar_norm;
+  float *w[MMSE_STAGE_LAYERS];
+  float *w_demapped; // 2 per RE
+} mmse_stage_buf_t;
+
+// A few hundred kilobytes for a full symbol, so the buffers are allocated once per thread and
+// reused, and grown if a later symbol needs more. They live as long as the thread, like other PHY
+// scratch.
+static mmse_stage_buf_t *mmse_stage_buf_get(const uint nb_re)
+{
+  static _Thread_local mmse_stage_buf_t buf;
+  if (buf.capacity_re >= nb_re)
+    return &buf;
+
+  free(buf.block);
+  // 19 arrays of one complex float per RE, one of two, then 3 arrays of one float per RE and one of two
+  const size_t sz = 21 * (size_t)nb_re * sizeof(cf_t) + 5 * (size_t)nb_re * sizeof(float);
+  buf.block = malloc16(sz);
+  AssertFatal(buf.block != NULL, "could not allocate %zu bytes of stage wise scratch\n", sz);
+
+  cf_t *c = (cf_t *)buf.block;
+  for (uint lay = 0; lay < MMSE_STAGE_LAYERS; lay++)
+    for (uint ant = 0; ant < MMSE_STAGE_ANTENNAS; ant++, c += nb_re)
+      buf.h[lay][ant] = c;
+  for (uint ant = 0; ant < MMSE_STAGE_ANTENNAS; ant++, c += nb_re)
+    buf.rxf[ant] = c;
+  for (uint lay = 0; lay < MMSE_STAGE_LAYERS; lay++, c += nb_re)
+    buf.b[lay] = c;
+  buf.g00 = c, c += nb_re;
+  buf.g10 = c, c += nb_re;
+  buf.g11 = c, c += nb_re;
+  buf.l00 = c, c += nb_re;
+  buf.l10 = c, c += nb_re;
+  buf.l11 = c, c += nb_re;
+  for (uint lay = 0; lay < MMSE_STAGE_LAYERS; lay++, c += nb_re)
+    buf.z[lay] = c;
+  for (uint lay = 0; lay < MMSE_STAGE_LAYERS; lay++, c += nb_re)
+    buf.x[lay] = c;
+  buf.tmp = c, c += nb_re;
+  buf.demapped = c, c += 2 * nb_re;
+
+  float *f = (float *)c;
+  buf.nvar_norm = f, f += nb_re;
+  for (uint lay = 0; lay < MMSE_STAGE_LAYERS; lay++, f += nb_re)
+    buf.w[lay] = f;
+  buf.w_demapped = f;
+
+  buf.capacity_re = nb_re;
+  return &buf;
+}
+
+// Processes a whole block of contiguous RBs of one symbol, stage by stage. Same arithmetic, same
+// normalization per RB and same output as process_symbol_subband_sse_2_layer_2_ant() called on each
+// RB of the block in turn, only the order in which the work is done differs.
+//
+// rxdataF and chest point at the start of the symbol, they are indexed by absolute RB as in the per
+// RB path. valid_re_mask holds one mask per RB of the block.
+static int process_symbol_stagewise_2_layer_2_ant(const c16_t *rxdataF,
+                                                  const c16_t *chest,
+                                                  const int start_rb,
+                                                  const int nb_rb,
+                                                  const uint16_t *valid_re_mask,
+                                                  c16_t cpe,
+                                                  int16_t *llr,
+                                                  uint32_t nvar,
+                                                  uint8_t mod_order,
+                                                  FILE *symbol_dump,
+                                                  FILE *llr_dump)
+{
+  const uint nof_ant = MMSE_STAGE_ANTENNAS;
+  const uint nof_layers = MMSE_STAGE_LAYERS;
+  const uint nb_re = (uint)nb_rb * NR_NB_SC_PER_RB;
+  int16_t *llr_start = llr;
+  mmse_stage_buf_t *buf = mmse_stage_buf_get(nb_re);
+
+  // Stage 1: c16_t to cf_t. This one still walks RB by RB, because the fixed point samples are
+  // interleaved per antenna within an RB, and because the normalization divisor is a per RB
+  // quantity, as in the per RB path.
+  for (int rb = 0; rb < nb_rb; rb++) {
+    const c16_t *ch = chest + (size_t)(start_rb + rb) * nof_ant * nof_layers * NR_NB_SC_PER_RB;
+    const c16_t *rx = rxdataF + (size_t)(start_rb + rb) * nof_ant * NR_NB_SC_PER_RB;
+    const int16_t x = factor2(nof_ant * NR_NB_SC_PER_RB);
+    const int16_t y = (nof_ant * NR_NB_SC_PER_RB) >> x;
+    const int32_t avg = simde_mm_average((simde__m128i *)ch, nof_ant * NR_NB_SC_PER_RB, x, y);
+    const float divisor = sqrt((double)avg / 2);
+    const uint off = (uint)rb * NR_NB_SC_PER_RB;
+
+    for (uint lay = 0; lay < nof_layers; lay++)
+      for (uint ant = 0; ant < nof_ant; ant++)
+        c16_to_cf_vector(ch + (lay * nof_ant + ant) * NR_NB_SC_PER_RB,
+                         buf->h[lay][ant] + off,
+                         NR_NB_SC_PER_RB,
+                         divisor);
+    for (uint ant = 0; ant < nof_ant; ant++)
+      c16_to_cf_vector(rx + ant * NR_NB_SC_PER_RB, buf->rxf[ant] + off, NR_NB_SC_PER_RB, divisor);
+
+    const float nvar_norm = (float)nvar / (divisor * divisor);
+    for (uint re = 0; re < NR_NB_SC_PER_RB; re++)
+      buf->nvar_norm[off + re] = nvar_norm;
+  }
+
+  // Stage 2: H^H * y
+  for (uint m = 0; m < nof_layers; m++) {
+    mult_conj_cf_vector(buf->h[m][0], buf->rxf[0], buf->b[m], nb_re);
+    mult_conj_cf_vector(buf->h[m][1], buf->rxf[1], buf->tmp, nb_re);
+    add_cf_vector(buf->b[m], buf->tmp, nb_re);
+  }
+
+  // Stage 3: the lower triangle of G = H^H * H, with the regularization on its diagonal
+  mult_conj_cf_vector(buf->h[0][0], buf->h[0][0], buf->g00, nb_re);
+  mult_conj_cf_vector(buf->h[0][1], buf->h[0][1], buf->tmp, nb_re);
+  add_cf_vector(buf->g00, buf->tmp, nb_re);
+  mult_conj_cf_vector(buf->h[1][0], buf->h[0][0], buf->g10, nb_re);
+  mult_conj_cf_vector(buf->h[1][1], buf->h[0][1], buf->tmp, nb_re);
+  add_cf_vector(buf->g10, buf->tmp, nb_re);
+  mult_conj_cf_vector(buf->h[1][0], buf->h[1][0], buf->g11, nb_re);
+  mult_conj_cf_vector(buf->h[1][1], buf->h[1][1], buf->tmp, nb_re);
+  add_cf_vector(buf->g11, buf->tmp, nb_re);
+  for (uint re = 0; re < nb_re; re++) {
+    // |h|^2 is real, the imaginary part only holds the rounding error of the FMA
+    buf->g00[re] = (cf_t){buf->g00[re].r + buf->nvar_norm[re], 0.0f};
+    buf->g11[re] = (cf_t){buf->g11[re].r + buf->nvar_norm[re], 0.0f};
+  }
+
+  // Stage 4: Cholesky decomposition
+  sqrt_cf_vector(buf->g00, buf->l00, nb_re);
+  div_cf_vector(buf->g10, buf->l00, buf->l10, nb_re);
+  mult_conj_cf_vector(buf->l10, buf->l10, buf->tmp, nb_re); // |l10|^2
+  for (uint re = 0; re < nb_re; re++)
+    buf->l11[re] = (cf_t){buf->g11[re].r - buf->tmp[re].r, 0.0f}; // both are real
+  sqrt_cf_vector(buf->l11, buf->l11, nb_re);
+
+  // Stage 5: forward substitution, L * z = H^H * y
+  div_cf_vector(buf->b[0], buf->l00, buf->z[0], nb_re);
+  mult_cf_vector(buf->l10, buf->z[0], buf->tmp, nb_re);
+  sub_cf_vector(buf->b[1], buf->tmp, buf->tmp, nb_re);
+  div_cf_vector(buf->tmp, buf->l11, buf->z[1], nb_re);
+
+  // Stage 6: backward substitution, L^H * x = z. The diagonal of L is real, so it is divided by as
+  // is, and only l10 is conjugated.
+  div_cf_vector(buf->z[1], buf->l11, buf->x[1], nb_re);
+  mult_conj_cf_vector(buf->l10, buf->x[1], buf->tmp, nb_re);
+  sub_cf_vector(buf->z[0], buf->tmp, buf->tmp, nb_re);
+  div_cf_vector(buf->tmp, buf->l00, buf->x[0], nb_re);
+
+  // Stage 7: unbiasing and LLR weights. [A^-1]_00 = a11 / det and [A^-1]_11 = a00 / det, with
+  // det = (l00 * l11)^2 and a00, a11 the regularized Gram diagonal still held by g00 and g11.
+  for (uint re = 0; re < nb_re; re++) {
+    const float sqrt_det = buf->l00[re].r * buf->l11[re].r;
+    const float inv_det = 1.0f / (sqrt_det * sqrt_det);
+    buf->w[0][re] = unbias_mmse_re(buf->g11[re].r * inv_det, buf->nvar_norm[re], &buf->x[0][re]);
+    buf->w[1][re] = unbias_mmse_re(buf->g00[re].r * inv_det, buf->nvar_norm[re], &buf->x[1][re]);
+  }
+
+  // Stage 8: drop the punctured REs and demap the layers, in one pass over the symbol
+  uint valid_re = 0;
+  for (int rb = 0; rb < nb_rb; rb++) {
+    const uint off = (uint)rb * NR_NB_SC_PER_RB;
+    for (uint16_t m = valid_re_mask[rb]; m; m &= m - 1) {
+      const uint re = off + __builtin_ctz(m);
+      buf->demapped[valid_re * 2] = buf->x[0][re];
+      buf->demapped[valid_re * 2 + 1] = buf->x[1][re];
+      buf->w_demapped[valid_re * 2] = buf->w[0][re];
+      buf->w_demapped[valid_re * 2 + 1] = buf->w[1][re];
+      valid_re++;
+    }
+  }
+  const uint num_valid_re_all_layers = valid_re * nof_layers;
+
+  if (symbol_dump) {
+    const size_t written = fwrite(buf->demapped, sizeof(*buf->demapped), num_valid_re_all_layers, symbol_dump);
+    if (written != num_valid_re_all_layers)
+      LOG_E(PHY, "wrote only %zu of %u equalized symbols to the dump file\n", written, num_valid_re_all_layers);
+  }
+
+  // Stage 9: the LLRs of the whole symbol
+  switch (mod_order) {
+    case 2:
+      nr_qpsk_llr_float(buf->demapped, buf->w_demapped, num_valid_re_all_layers, llr);
+      break;
+
+    case 4:
+      nr_16qam_llr_float(buf->demapped, buf->w_demapped, num_valid_re_all_layers, llr);
+      break;
+
+    case 6:
+      break;
+
+    case 8:
+      break;
+
+    default:
+      break;
+  }
+
+  if (llr_dump) {
+    const size_t written = fwrite(llr, sizeof(*llr), num_valid_re_all_layers * mod_order, llr_dump);
+    if (written != num_valid_re_all_layers * mod_order)
+      LOG_E(PHY, "wrote only %zu of %u llr to the dump file\n", written, num_valid_re_all_layers * mod_order);
+  }
+  llr += num_valid_re_all_layers * mod_order;
+  return (int)(llr - llr_start);
+}
+
 #define PDSCH_DUMP_FILE
 
 #ifdef PDSCH_DUMP_FILE
 FILE *nr_pdsch_symbol_dump = NULL;
 FILE *nr_pdsch_llr_dump = NULL;
+
+// Set to true to run the 2 layer 2 antenna case through the stage wise solver rather than the per RB
+// one. External linkage so that an experiment can flip it from wherever it is driven.
+bool nr_pdsch_stagewise = false;
 #endif
 
 int pdsch_process_symbol(const c16_t *rxdataF,
@@ -2148,6 +2399,30 @@ int pdsch_process_symbol(const c16_t *rxdataF,
   while (find_next_rb_block(freq_alloc->bitmap, dlsch_config->BWPSize, &pos, &block_start, &block_end)) {
     int start_rb = block_start + dlsch_config->BWPStart;
     int nb_rb = block_end - block_start + 1;
+
+    if (nr_pdsch_stagewise && nb_layer == 2 && nb_rx == 2) {
+      // The stage wise solver takes the whole block at once, so the RE masks are collected first
+      uint16_t masks[MAX_BWP_SIZE];
+      AssertFatal(nb_rb <= (int)sizeofArray(masks), "%d RBs in one block\n", nb_rb);
+      for (int rb = 0; rb < nb_rb; rb++) {
+        const uint16_t ptrs_re_bitmap = IS_BIT_SET(ptrs_symb_pos, symbol)
+                                            ? get_ptrs_re_bitmap(rnti, nb_rb, start_rb + rb, k_re_ref, k_ptrs, k_rb_ref)
+                                            : 0;
+        masks[rb] = get_combined_valid_re_bitmap(start_rb + rb, ptrs_re_bitmap, dmrs_res_bitmap, csi_res_bitmap);
+      }
+      llr += process_symbol_stagewise_2_layer_2_ant(rxdataF,
+                                                   chest,
+                                                   start_rb,
+                                                   nb_rb,
+                                                   masks,
+                                                   cpe,
+                                                   llr,
+                                                   nvar,
+                                                   mod_order,
+                                                   nr_pdsch_symbol_dump,
+                                                   nr_pdsch_llr_dump);
+      continue;
+    }
 
     // Process one PRB
     for (int rb = start_rb; rb < start_rb + nb_rb; rb++) {
