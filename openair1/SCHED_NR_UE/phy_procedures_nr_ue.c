@@ -422,6 +422,20 @@ static void nr_ue_measurement_procedures(uint16_t l,
   }
 }
 
+static bool is_double_symb_dmrs(int x)
+{
+  uint32_t lo = x & 0x3fffu;
+  return (x & (lo << 1)) != 0;
+}
+
+static inline uint32_t get_dmrs_group_bitmap(uint32_t x)
+{
+  uint32_t lo = x & 0x3fffu;
+  // clear any bit in the low 14 whose lower neighbour is also set.
+  // for double symbol dmrs, the second dmrs symbol bit is cleared.
+  return x & ~((lo << 1) & lo);
+}
+
 static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
                                   const UE_nr_rxtx_proc_t *proc,
                                   NR_UE_DLSCH_t *dlsch,
@@ -475,9 +489,11 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
   NR_DL_FRAME_PARMS *frame_parms = &ue->frame_parms;
   uint32_t nvar = 0;
 
+  const uint32_t dmrs_group_bitmap = get_dmrs_group_bitmap(dmrs_symb_bitmap);
+  const bool is_dbl_symb_dmrs = is_double_symb_dmrs(dmrs_symb_bitmap);
   start_meas_nr_ue_phy(ue, DLSCH_CHANNEL_ESTIMATION_STATS);
   for (int m = dlschCfg->start_symbol; m < (dlschCfg->start_symbol + dlschCfg->number_symbols); m++) {
-    if (dmrs_symb_bitmap & (1 << m)) {
+    if (dmrs_group_bitmap & (1 << m)) {
       for (int nl = 0; nl < dlsch->cw_info.Nl; nl++) { // for MIMO Config: it shall loop over no_layers
         LOG_D(PHY, "PDSCH Channel estimation layer %d, slot %d, symbol %d\n", nl, nr_slot_rx, m);
         uint32_t nvar_tmp = 0;
@@ -492,7 +508,8 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
                                     pdsch_dl_ch_estimates,
                                     frame_parms->samples_per_slot_wCP,
                                     rxdataF,
-                                    &nvar_tmp);
+                                    &nvar_tmp,
+                                    is_dbl_symb_dmrs);
         nvar += nvar_tmp;
       }
     }
