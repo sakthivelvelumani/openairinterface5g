@@ -1621,6 +1621,7 @@ void update_dmrs_config(NR_BWP_Downlink_t *bwp, int8_t* dmrs_arg)
   int8_t  mapping_type = typeA;//default value
   int8_t  add_pos = pdsch_dmrs_pos0;//default value
   int8_t  dmrs_config_type = NFAPI_NR_DMRS_TYPE1;//default value
+  int8_t num_front_load_dmrs = 1; // default
 
   if(dmrs_arg[0] == 0) {
     mapping_type = typeA;
@@ -1645,22 +1646,30 @@ void update_dmrs_config(NR_BWP_Downlink_t *bwp, int8_t* dmrs_arg)
     dmrs_config_type = NFAPI_NR_DMRS_TYPE2;
   }
 
+  // Single or double symbol dmrs
+  if (dmrs_arg[3] == 1 || dmrs_arg[3] == 2) {
+    num_front_load_dmrs = dmrs_arg[3];
+  } else {
+    AssertFatal(1 == 0, "Incorrect number of front-loaded DMRS symbol. Valid options: 1, 2\n");
+  }
+
   AssertFatal((bwp->bwp_Dedicated->pdsch_Config != NULL && bwp->bwp_Dedicated->pdsch_Config->choice.setup != NULL), "Base RRC reconfig structures are not allocated.\n");
 
+#define CALLOC_IFF_NULL(a)               \
+  do {                                   \
+    if (a == NULL) {                     \
+      a = calloc_or_fail(1, sizeof(*a)); \
+    }                                    \
+  } while (0)
+
   if(mapping_type == typeA) {
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA =
-        calloc_or_fail(1, sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA));
+    CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA);
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->present= NR_SetupRelease_DMRS_DownlinkConfig_PR_setup;
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup =
-        calloc_or_fail(1,
-                       sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup));
-    if (dmrs_config_type == NFAPI_NR_DMRS_TYPE2)
-      bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->dmrs_Type = calloc_or_fail(
-          1,
-          sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->dmrs_Type));
-    else
+    CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup);
+    if (dmrs_config_type == NFAPI_NR_DMRS_TYPE2) {
+      CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->dmrs_Type);
+    } else
       bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->dmrs_Type = NULL;
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->maxLength=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->scramblingID0=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->scramblingID1=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeA->choice.setup->phaseTrackingRS=NULL;
@@ -1669,19 +1678,13 @@ void update_dmrs_config(NR_BWP_Downlink_t *bwp, int8_t* dmrs_arg)
   }
 
   if(mapping_type == typeB) {
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB =
-        calloc_or_fail(1, sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB));
+    CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB);
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->present= NR_SetupRelease_DMRS_DownlinkConfig_PR_setup;
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup =
-        calloc_or_fail(1,
-                       sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup));
-    if (dmrs_config_type == NFAPI_NR_DMRS_TYPE2)
-      bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->dmrs_Type = calloc_or_fail(
-          1,
-          sizeof(*bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->dmrs_Type));
-    else
+    CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup);
+    if (dmrs_config_type == NFAPI_NR_DMRS_TYPE2) {
+      CALLOC_IFF_NULL(bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->dmrs_Type);
+    } else
       bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->dmrs_Type = NULL;
-    bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->maxLength=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->scramblingID0=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->scramblingID1=NULL;
     bwp->bwp_Dedicated->pdsch_Config->choice.setup->dmrs_DownlinkForPDSCH_MappingTypeB->choice.setup->phaseTrackingRS=NULL;
@@ -1695,9 +1698,7 @@ void update_dmrs_config(NR_BWP_Downlink_t *bwp, int8_t* dmrs_arg)
   NR_DMRS_DownlinkConfig_t *dmrs_config = (mapping_type == typeA) ? dmrs_MappingtypeA->choice.setup : dmrs_MappingtypeB->choice.setup;
 
   if (add_pos != 2) { // pos0,pos1,pos3
-    if (dmrs_config->dmrs_AdditionalPosition == NULL) {
-      dmrs_config->dmrs_AdditionalPosition = calloc_or_fail(1, sizeof(*dmrs_MappingtypeA->choice.setup->dmrs_AdditionalPosition));
-    }
+    CALLOC_IFF_NULL(dmrs_config->dmrs_AdditionalPosition);
     switch (add_pos) {
       case 0:
         *dmrs_config->dmrs_AdditionalPosition = NR_DMRS_DownlinkConfig__dmrs_AdditionalPosition_pos0;
@@ -1716,9 +1717,20 @@ void update_dmrs_config(NR_BWP_Downlink_t *bwp, int8_t* dmrs_arg)
     dmrs_config->dmrs_AdditionalPosition = NULL;
   }
 
+  if (num_front_load_dmrs == 2) {
+    CALLOC_IFF_NULL(dmrs_config->maxLength);
+    *dmrs_config->maxLength = NR_DMRS_DownlinkConfig__maxLength_len2;
+  }
+
   for (int i=0;i<bwp->bwp_Common->pdsch_ConfigCommon->choice.setup->pdsch_TimeDomainAllocationList->list.count;i++) {
     bwp->bwp_Common->pdsch_ConfigCommon->choice.setup->pdsch_TimeDomainAllocationList->list.array[i]->mappingType = mapping_type;
   }
 
-  printf("[DLSIM] DMRS Config is modified with Mapping Type %d, Additional Positions %d Config. Type %d \n", mapping_type, add_pos, dmrs_config_type);
+  printf(
+      "[DLSIM] DMRS Config is modified with Mapping Type %d, Additional Positions %d Config. Type %d, Number of frontloaded DMRS "
+      "%d \n",
+      mapping_type,
+      add_pos,
+      dmrs_config_type,
+      num_front_load_dmrs);
 }
