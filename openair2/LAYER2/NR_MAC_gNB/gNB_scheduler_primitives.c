@@ -301,10 +301,11 @@ uint8_t get_mcs_from_cqi(int mcs_table, int cqi_table, int cqi_idx)
 NR_pdsch_dmrs_t get_dl_dmrs_params(const NR_ServingCellConfigCommon_t *scc,
                                    const NR_UE_DL_BWP_t *dl_bwp,
                                    const NR_tda_info_t *tda_info,
-                                   const int Layers)
+                                   const int Layers,
+                                   const uint frontloaded_symb)
 {
+  AssertFatal(frontloaded_symb <= 2, "Invalid frontloaded DMRS config. Must be either 1 or 2\n");
   NR_pdsch_dmrs_t dmrs = {0};
-  int frontloaded_symb = 1; // default value
   nr_dci_format_t dci_format = dl_bwp ? dl_bwp->dci_format : NR_DL_DCI_FORMAT_1_0;
   if (dci_format == NR_DL_DCI_FORMAT_1_0) {
     dmrs.numDmrsCdmGrpsNoData = tda_info->nrOfSymbols <= 2 ? 1 : 2;
@@ -318,29 +319,48 @@ NR_pdsch_dmrs_t get_dl_dmrs_params(const NR_ServingCellConfigCommon_t *scc,
     //     number of front loaded symbols need to be consistent with maxLength
     //     when a more complete implementation is done
 
-    switch (Layers) {
-      case 1:
-        dmrs.dmrs_ports_id = 0;
-        dmrs.numDmrsCdmGrpsNoData = 1;
-        frontloaded_symb = 1;
-        break;
-      case 2:
-        dmrs.dmrs_ports_id = 2;
-        dmrs.numDmrsCdmGrpsNoData = 1;
-        frontloaded_symb = 1;
-        break;
-      case 3:
-        dmrs.dmrs_ports_id = 9;
-        dmrs.numDmrsCdmGrpsNoData = 2;
-        frontloaded_symb = 1;
-        break;
-      case 4:
-        dmrs.dmrs_ports_id = 10;
-        dmrs.numDmrsCdmGrpsNoData = 2;
-        frontloaded_symb = 1;
-        break;
-      default:
-        AssertFatal(1==0,"Number of layers %d\n not supported or not valid\n",Layers);
+    if (frontloaded_symb == 1) {
+      switch (Layers) {
+        case 1:
+          dmrs.dmrs_ports_id = 0;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        case 2:
+          dmrs.dmrs_ports_id = 2;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        case 3:
+          dmrs.dmrs_ports_id = 9;
+          dmrs.numDmrsCdmGrpsNoData = 2;
+          break;
+        case 4:
+          dmrs.dmrs_ports_id = 10;
+          dmrs.numDmrsCdmGrpsNoData = 2;
+          break;
+        default:
+          AssertFatal(1 == 0, "Number of layers %d\n not supported or not valid\n", Layers);
+      }
+    } else {
+      switch (Layers) {
+        case 1:
+          dmrs.dmrs_ports_id = 12;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        case 2:
+          dmrs.dmrs_ports_id = 20;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        case 3:
+          dmrs.dmrs_ports_id = 26;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        case 4:
+          dmrs.dmrs_ports_id = 28;
+          dmrs.numDmrsCdmGrpsNoData = 1;
+          break;
+        default:
+          AssertFatal(1 == 0, "Number of layers %d\n not supported or not valid\n", Layers);
+      }
     }
   }
 
@@ -354,9 +374,15 @@ NR_pdsch_dmrs_t get_dl_dmrs_params(const NR_ServingCellConfigCommon_t *scc,
     dmrs.phaseTrackingRS = dmrs_Config->phaseTrackingRS ? dmrs_Config->phaseTrackingRS->choice.setup : NULL;
     dmrs.dmrsConfigType = dmrs_Config->dmrs_Type != NULL;
     scramblingID = dmrs.n_scid ? dmrs_Config->scramblingID1 : dmrs_Config->scramblingID0;
+    // frontloaded_symb must be consistent with maxLength set in dmrs_Config.
+    if (frontloaded_symb == 2)
+      AssertFatal(dmrs_Config->maxLength && *dmrs_Config->maxLength == NR_DMRS_DownlinkConfig__maxLength_len2,
+                  "Invalid frontloaded DMRS symbol config\n");
   } else {
     dmrs.dmrsConfigType = NFAPI_NR_DMRS_TYPE1;
     dmrs.phaseTrackingRS = NULL;
+    // single symbol dmrs if no pdsch_Config is present.
+    AssertFatal(frontloaded_symb == 1, "Invalid frontloaded DMRS symbol config\n");
   }
   dmrs.scrambling_id = scramblingID ? *scramblingID : *scc->physCellId;
   dmrs.N_PRB_DMRS = dmrs.numDmrsCdmGrpsNoData * (dmrs.dmrsConfigType == NFAPI_NR_DMRS_TYPE1 ? 6 : 4);

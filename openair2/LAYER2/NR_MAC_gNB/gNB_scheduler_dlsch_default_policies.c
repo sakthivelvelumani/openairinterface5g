@@ -265,7 +265,8 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
     NR_pdsch_dmrs_t dmrs = get_dl_dmrs_params(cell->common_channels.ServingCellConfigCommon,
                                               &cand->UE->current_DL_BWP,
                                               &cand->sched_pdsch.tda_info,
-                                              cand->sched_pdsch.nrOfLayers);
+                                              cand->sched_pdsch.nrOfLayers,
+                                              1);
     const int oh = 3 * 4 + (cand->UE->UE_sched_ctrl.ta_apply ? 2 : 0);
     uint32_t tbs;
     nr_find_nb_rb(Qm,
